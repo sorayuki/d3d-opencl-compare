@@ -33,4 +33,3 @@ bool opencl_nv12_to_bgra_frame(
 #else
 #error A benchmark backend must be selected
 #endif
-

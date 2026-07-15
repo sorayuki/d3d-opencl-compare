@@ -8,7 +8,9 @@
 #include <cstdlib>
 #include <exception>
 #include <iomanip>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -18,15 +20,12 @@ namespace {
 using Microsoft::WRL::ComPtr;
 using Clock = std::chrono::steady_clock;
 
-constexpr std::size_t kWidth = 1920;
-constexpr std::size_t kHeight = 1080;
-constexpr std::size_t kYBytes = kWidth * kHeight;
-constexpr std::size_t kUvBytes = kWidth * kHeight / 2;
-constexpr std::size_t kRgbBytes = kWidth * kHeight * 4;
-
 struct Options {
     double seconds = 5.0;
     unsigned int warmup_frames = 20;
+    std::size_t width = 1920;
+    std::size_t height = 1080;
+    std::string output_path;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -37,9 +36,15 @@ Options parse_options(int argc, char** argv) {
             options.seconds = std::stod(argv[++i]);
         } else if (argument == "--warmup" && i + 1 < argc) {
             options.warmup_frames = static_cast<unsigned int>(std::stoul(argv[++i]));
+        } else if (argument == "--width" && i + 1 < argc) {
+            options.width = std::stoull(argv[++i]);
+        } else if (argument == "--height" && i + 1 < argc) {
+            options.height = std::stoull(argv[++i]);
+        } else if (argument == "--output" && i + 1 < argc) {
+            options.output_path = argv[++i];
         } else if (argument == "--help") {
             std::cout << "Usage: " << argv[0]
-                      << " [--seconds N] [--warmup N]\n";
+                      << " [--seconds N] [--warmup N] [--width N] [--height N] [--output FILE]\n";
             std::exit(0);
         } else {
             throw std::invalid_argument("Unknown or incomplete argument: " + argument);
@@ -47,6 +52,18 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.seconds <= 0.0) {
         throw std::invalid_argument("--seconds must be greater than zero");
+    }
+    if (options.width < 2 || options.height < 2 ||
+        (options.width & 1) || (options.height & 1)) {
+        throw std::invalid_argument("NV12 width and height must be even and at least 2");
+    }
+    const auto max_size = (std::numeric_limits<std::size_t>::max)();
+    if (options.width > max_size / options.height) {
+        throw std::invalid_argument("NV12 dimensions are too large");
+    }
+    const auto pixels = options.width * options.height;
+    if (pixels > max_size / 4 || pixels > max_size - pixels / 2) {
+        throw std::invalid_argument("NV12 frame allocation is too large");
     }
     return options;
 }
@@ -86,34 +103,34 @@ asco::ColorInfo make_color_info() {
     return info;
 }
 
-void fill_nv12(std::vector<unsigned char>& input) {
-    for (std::size_t y = 0; y < kHeight; ++y) {
-        for (std::size_t x = 0; x < kWidth; ++x) {
-            input[y * kWidth + x] = static_cast<unsigned char>(16 + ((x + y) % 220));
+void fill_nv12(std::vector<unsigned char>& input, std::size_t width, std::size_t height) {
+    for (std::size_t y = 0; y < height; ++y) {
+        for (std::size_t x = 0; x < width; ++x) {
+            input[y * width + x] = static_cast<unsigned char>(16 + ((x + y) % 220));
         }
     }
-    auto* uv = input.data() + kYBytes;
-    for (std::size_t y = 0; y < kHeight / 2; ++y) {
-        for (std::size_t x = 0; x < kWidth; x += 2) {
-            uv[y * kWidth + x] = static_cast<unsigned char>(96 + ((x / 2) % 64));
-            uv[y * kWidth + x + 1] = static_cast<unsigned char>(96 + (y % 64));
+    auto* uv = input.data() + width * height;
+    for (std::size_t y = 0; y < height / 2; ++y) {
+        for (std::size_t x = 0; x < width; x += 2) {
+            uv[y * width + x] = static_cast<unsigned char>(96 + ((x / 2) % 64));
+            uv[y * width + x + 1] = static_cast<unsigned char>(96 + (y % 64));
         }
     }
 }
 
 bool convert(const asco::ColorInfo& color_info,
              const std::vector<unsigned char>& input,
-             std::vector<unsigned char>& output) {
+             std::vector<unsigned char>& output, std::size_t width, std::size_t height) {
     const void* y = input.data();
-    const void* uv = input.data() + kYBytes;
+    const void* uv = input.data() + width * height;
 #if defined(BENCHMARK_D3D11)
-    return d3d11_nv12_to_bgra_frame(color_info, kWidth, kHeight,
-                                    output.data(), kWidth * 4,
-                                    y, kWidth, uv, kWidth);
-#else
-    return opencl_nv12_to_bgra_frame(color_info, kWidth, kHeight,
-                                     output.data(), kWidth * 4,
-                                     y, kWidth, uv, kWidth);
+    return d3d11_nv12_to_bgra_frame(color_info, width, height,
+                                    output.data(), width * 4,
+                                    y, width, uv, width);
+#elif defined(BENCHMARK_OPENCL)
+    return opencl_nv12_to_bgra_frame(color_info, width, height,
+                                     output.data(), width * 4,
+                                     y, width, uv, width);
 #endif
 }
 
@@ -129,7 +146,7 @@ int main(int argc, char** argv) {
         if (!is_d3d11_colorconv_avail()) {
             throw std::runtime_error("D3D11 color conversion initialization failed");
         }
-#else
+#elif defined(BENCHMARK_OPENCL)
         init_opencl(device.Get());
         if (!is_opencl_avail()) {
             throw std::runtime_error(
@@ -137,13 +154,14 @@ int main(int argc, char** argv) {
         }
 #endif
 
-        std::vector<unsigned char> input(kYBytes + kUvBytes);
-        std::vector<unsigned char> output(kRgbBytes);
-        fill_nv12(input);
+        const std::size_t y_bytes = options.width * options.height;
+        std::vector<unsigned char> input(y_bytes + y_bytes / 2);
+        std::vector<unsigned char> output(y_bytes * 4);
+        fill_nv12(input, options.width, options.height);
         const auto color_info = make_color_info();
 
         for (unsigned int i = 0; i < options.warmup_frames; ++i) {
-            if (!convert(color_info, input, output)) {
+            if (!convert(color_info, input, output, options.width, options.height)) {
                 throw std::runtime_error("Conversion failed during warmup");
             }
         }
@@ -152,20 +170,27 @@ int main(int argc, char** argv) {
         const auto deadline = start + std::chrono::duration<double>(options.seconds);
         std::uint64_t frames = 0;
         do {
-            if (!convert(color_info, input, output)) {
+            if (!convert(color_info, input, output, options.width, options.height)) {
                 throw std::runtime_error("Conversion failed during measurement");
             }
             ++frames;
         } while (Clock::now() < deadline);
 
         const double elapsed = std::chrono::duration<double>(Clock::now() - start).count();
-        std::uint64_t checksum = 0;
-        for (std::size_t i = 0; i < output.size(); i += 4096) {
-            checksum = checksum * 131 + output[i];
+        std::uint64_t checksum = 1469598103934665603ull;
+        for (const auto value : output) {
+            checksum = (checksum ^ value) * 1099511628211ull;
+        }
+        if (!options.output_path.empty()) {
+            std::ofstream file(options.output_path, std::ios::binary);
+            file.write(reinterpret_cast<const char *>(output.data()),
+                       static_cast<std::streamsize>(output.size()));
+            if (!file)
+                throw std::runtime_error("Failed to write output file");
         }
 
         std::cout << "Backend:    " << BENCHMARK_BACKEND_NAME << '\n'
-                  << "Resolution: " << kWidth << 'x' << kHeight << " NV12 -> BGRA\n"
+                  << "Resolution: " << options.width << 'x' << options.height << " NV12 -> BGRA\n"
                   << "Frames:     " << frames << '\n'
                   << std::fixed << std::setprecision(3)
                   << "Elapsed:    " << elapsed << " s\n"
@@ -178,4 +203,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-
