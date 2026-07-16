@@ -3,11 +3,23 @@ cmake_minimum_required(VERSION 3.21)
 project(dx_cl_compare LANGUAGES CXX)
 
 if(NOT WIN32)
-    message(FATAL_ERROR "This benchmark requires Windows (D3D11).")
+    message(FATAL_ERROR "This benchmark requires Windows (Direct3D).")
 endif()
 
 set(BACKEND_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/backends")
 set(OPENCL_SDK "${CMAKE_CURRENT_SOURCE_DIR}/third_party/opencl")
+
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles([[
+    #include <d3d12.h>
+    int main() {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS16 options{};
+        (void)options;
+        (void)D3D12_FEATURE_D3D12_OPTIONS16;
+        (void)D3D12_HEAP_TYPE_GPU_UPLOAD;
+        return 0;
+    }
+]] HAVE_D3D12_GPU_UPLOAD_HEAP)
 
 function(configure_benchmark target backend_name backend_define)
     target_compile_features(${target} PRIVATE cxx_std_17)
@@ -24,19 +36,27 @@ function(configure_benchmark target backend_name backend_define)
     endif()
 endfunction()
 
-add_executable(compare_d3d11_r8 src/main.cpp "${BACKEND_DIR}/cc_d3d11_r8.cpp")
-configure_benchmark(compare_d3d11_r8 "D3D11 R8 (00dde8a)" BENCHMARK_D3D11)
+add_executable(compare_d3d11_r8 src/main.cpp "${BACKEND_DIR}/cc_d3d11.cpp")
+configure_benchmark(compare_d3d11_r8 "D3D11 (current colorconv)" BENCHMARK_D3D11)
 target_link_libraries(compare_d3d11_r8 PRIVATE d3dcompiler)
 
-add_executable(compare_d3d11_r32 src/main.cpp "${BACKEND_DIR}/cc_d3d11_r32.cpp")
-configure_benchmark(compare_d3d11_r32 "D3D11 R32 (31fd0d9)" BENCHMARK_D3D11)
-target_link_libraries(compare_d3d11_r32 PRIVATE d3dcompiler)
+add_executable(compare_d3d12 src/main.cpp "${BACKEND_DIR}/cc_d3d12.cpp")
+configure_benchmark(compare_d3d12 "D3D12" BENCHMARK_D3D12)
+target_link_libraries(compare_d3d12 PRIVATE d3d12 d3dcompiler)
+if(HAVE_D3D12_GPU_UPLOAD_HEAP)
+    target_compile_definitions(compare_d3d12 PRIVATE HAVE_D3D12_GPU_UPLOAD_HEAP=1)
+endif()
 
 add_executable(compare_opencl src/main.cpp "${BACKEND_DIR}/cc_opencl.cpp")
 configure_benchmark(compare_opencl "OpenCL" BENCHMARK_OPENCL)
 target_include_directories(compare_opencl PRIVATE "${OPENCL_SDK}/include")
-target_link_libraries(compare_opencl PRIVATE "${OPENCL_SDK}/lib/OpenCL.lib")
-add_custom_command(TARGET compare_opencl POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-        "${OPENCL_SDK}/bin/OpenCL.dll"
-        "$<TARGET_FILE_DIR:compare_opencl>/OpenCL.dll")
+string(TOUPPER "${CMAKE_GENERATOR_PLATFORM}" TARGET_PLATFORM)
+if(TARGET_PLATFORM STREQUAL "ARM64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
+    target_link_libraries(compare_opencl PRIVATE "${OPENCL_SDK}/lib/arm64/OpenCL.lib")
+else()
+    target_link_libraries(compare_opencl PRIVATE "${OPENCL_SDK}/lib/OpenCL.lib")
+    add_custom_command(TARGET compare_opencl POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${OPENCL_SDK}/bin/OpenCL.dll"
+            "$<TARGET_FILE_DIR:compare_opencl>/OpenCL.dll")
+endif()

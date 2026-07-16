@@ -26,10 +26,6 @@ namespace {
     bool isClShareMemory_ = false;
     bool isClSvmSupported_ = false;
 
-    static clCreateFromD3D11Texture2DKHR_fn pfnClCreateFromD3D11Texture2DKHR = nullptr;
-    static clEnqueueAcquireD3D11ObjectsKHR_fn pfnClEnqueueAcquireD3D11ObjectsKHR = nullptr;
-    static clEnqueueReleaseD3D11ObjectsKHR_fn pfnClEnqueueReleaseD3D11ObjectsKHR = nullptr;
-
     std::atomic_size_t poolSizeSum_{ 0 };
 
     template<class BufT>
@@ -188,25 +184,14 @@ static void InitCLEnv() try {
             cl::vector<cl::Device> devices;
             p.getDevices(CL_DEVICE_TYPE_ALL, &devices);
 
-            // 找到当前平台下，可以和指定Direct3DContext共享资源的设备
-            clGetDeviceIDsFromD3D11KHR_fn pfnClGetDeviceIDsFromD3D11KHR = nullptr;
-            cl_device_id devid = 0;
-            cl_uint devcnt = 0;
-            cl_int clerr = -1;
-            pfnClGetDeviceIDsFromD3D11KHR = (clGetDeviceIDsFromD3D11KHR_fn)clGetExtensionFunctionAddressForPlatform(p(), "clGetDeviceIDsFromD3D11NV");
-            if (pfnClGetDeviceIDsFromD3D11KHR) {
-                clerr = pfnClGetDeviceIDsFromD3D11KHR(p(), CL_D3D11_DEVICE_KHR, shared_d3d11dev_, CL_PREFERRED_DEVICES_FOR_D3D11_KHR, 1, &devid, &devcnt);
-            }
-
-            if (clerr != 0) {
-                pfnClGetDeviceIDsFromD3D11KHR = (clGetDeviceIDsFromD3D11KHR_fn)clGetExtensionFunctionAddressForPlatform(p(), "clGetDeviceIDsFromD3D11KHR");
-                if (pfnClGetDeviceIDsFromD3D11KHR) {
-                    clerr = pfnClGetDeviceIDsFromD3D11KHR(p(), CL_D3D11_DEVICE_KHR, shared_d3d11dev_, CL_PREFERRED_DEVICES_FOR_D3D11_KHR, 1, &devid, &devcnt);
+            for (auto& dev : devices) {
+                auto devver = dev.getInfo<CL_DEVICE_VERSION>();
+                if (devver.find("OpenCL 2.") != std::string::npos ||
+                    devver.find("OpenCL 3.") != std::string::npos)
+                {
+                    platdevlist.emplace_back(std::make_tuple(p, dev));
                 }
             }
-
-            if (clerr == 0)
-                platdevlist.emplace_back(std::make_tuple(p, devid));
         }
     }
 
@@ -248,28 +233,6 @@ static void InitCLEnv() try {
             isClShareMemory_ = true;
         }
     }
-
-    // 获取扩展函数
-    if (!pfnClCreateFromD3D11Texture2DKHR)
-        pfnClCreateFromD3D11Texture2DKHR = (clCreateFromD3D11Texture2DKHR_fn)clGetExtensionFunctionAddressForPlatform(clPlat_(), "clCreateFromD3D11Texture2DNV");
-    if (!pfnClCreateFromD3D11Texture2DKHR)
-        pfnClCreateFromD3D11Texture2DKHR = (clCreateFromD3D11Texture2DKHR_fn)clGetExtensionFunctionAddressForPlatform(clPlat_(), "clCreateFromD3D11Texture2DKHR");
-    if (!pfnClCreateFromD3D11Texture2DKHR)
-        return;
-
-    if (!pfnClEnqueueAcquireD3D11ObjectsKHR)
-        pfnClEnqueueAcquireD3D11ObjectsKHR = (clEnqueueAcquireExternalMemObjectsKHR_fn)clGetExtensionFunctionAddressForPlatform(clPlat_(), "clEnqueueAcquireD3D11ObjectsNV");
-    if (!pfnClEnqueueAcquireD3D11ObjectsKHR)
-        pfnClEnqueueAcquireD3D11ObjectsKHR = (clEnqueueAcquireExternalMemObjectsKHR_fn)clGetExtensionFunctionAddressForPlatform(clPlat_(), "clEnqueueAcquireD3D11ObjectsKHR");
-    if (!pfnClEnqueueAcquireD3D11ObjectsKHR)
-        return;
-
-    if (!pfnClEnqueueReleaseD3D11ObjectsKHR)
-        pfnClEnqueueReleaseD3D11ObjectsKHR = (clEnqueueReleaseExternalMemObjectsKHR_fn)clGetExtensionFunctionAddressForPlatform(clPlat_(), "clEnqueueReleaseD3D11ObjectsNV");
-    if (!pfnClEnqueueReleaseD3D11ObjectsKHR)
-        pfnClEnqueueReleaseD3D11ObjectsKHR = (clEnqueueReleaseExternalMemObjectsKHR_fn)clGetExtensionFunctionAddressForPlatform(clPlat_(), "clEnqueueReleaseD3D11ObjectsKHR");
-    if (!pfnClEnqueueReleaseD3D11ObjectsKHR)
-        return;
 
     // 编译kernel程序
     std::string sourcecode{ R"OPENCLCODE(
@@ -645,49 +608,7 @@ bool opencl_i420_to_image2d(
     size_t width, size_t height,
     void* tex2d
 ) {
-    auto pTex2d = (ID3D11Texture2D*)tex2d;
-
-    auto impl = [&](auto t) {
-        using BufT = decltype(t);
-
-        if (!is_opencl_avail())
-            return false;
-
-        cl_int err;
-        cl::Memory dstmem{ pfnClCreateFromD3D11Texture2DKHR(ctx_(), CL_MEM_WRITE_ONLY, pTex2d, 0, &err), false };
-
-        if (err)
-            return false;
-
-        auto [k, yuvscale] = GetConvConst(ci);
-
-        auto func = cl::KernelFunctor<
-            cl::Memory,
-            BufT, cl_int, BufT, cl_int, BufT, cl_int,
-            cl_float3, cl_float4>
-            (program_, "i420_to_image2d");
-
-        CCClBuffer &ybuf = *y.data_,
-            &ubuf = *u.data_,
-            &vbuf = *v.data_;
-
-        pfnClEnqueueAcquireD3D11ObjectsKHR(queue_(), 1, &dstmem(), 0, nullptr, nullptr);
-        func(cl::EnqueueArgs(queue_, cl::NDRange(width / 2, height / 2)),
-            dstmem,
-            ybuf, (cl_int)strideY, ubuf, (cl_int)strideU, vbuf, (cl_int)strideV,
-            k, yuvscale
-        );
-        pfnClEnqueueReleaseD3D11ObjectsKHR(queue_(), 1, &dstmem(), 0, nullptr, nullptr);
-
-        queue_.finish();
-
-        return true;
-    };
-
-    if (isClSvmSupported_)
-        return impl((void*)nullptr);
-    else
-        return impl(cl::Buffer{});
+    return false;
 }
 
 

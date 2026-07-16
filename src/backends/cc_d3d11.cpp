@@ -21,13 +21,14 @@ ComPtr<ID3D11DeviceContext> g_ctx;
 std::mutex g_run_mutex;
 ComPtr<ID3D11ComputeShader> g_nv12_to_bgra, g_i420_to_bgra;
 ComPtr<ID3D11ComputeShader> g_i420_to_image2d, g_yuy2_to_bgra;
+ComPtr<ID3D11ComputeShader> g_yuy2_to_bgra_unaligned;
 ComPtr<ID3D11ComputeShader> g_bgra_to_i420;
 bool g_enabled = true;
 
 
 struct Params {
     float k[3];
-    float pad;
+    float inv_k_y;
     float range[4];
     UINT w, h;
     UINT ys, us, vs, os;
@@ -38,7 +39,7 @@ struct Params {
 const char *kShader = R"(
 cbuffer P : register(b0) {
     float3 k;
-    float pad;
+    float inv_k_y;
     float4 range;
     uint w;
     uint h;
@@ -63,6 +64,16 @@ uint load_byte(ByteAddressBuffer buffer, uint byte_offset) {
     return (packed >> ((byte_offset & 3) * 8)) & 255;
 }
 
+uint load_dword(ByteAddressBuffer buffer, uint byte_offset) {
+    uint aligned_offset = byte_offset & ~3;
+    uint low = buffer.Load(aligned_offset);
+    uint shift = (byte_offset & 3) * 8;
+    if (shift == 0)
+        return low;
+    uint high = buffer.Load(aligned_offset + 4);
+    return (low >> shift) | (high << (32 - shift));
+}
+
 uint2 load_two_bytes(ByteAddressBuffer buffer, uint byte_offset) {
     uint lane = byte_offset & 3;
     uint packed = buffer.Load(byte_offset & ~3);
@@ -74,19 +85,22 @@ uint2 load_two_bytes(ByteAddressBuffer buffer, uint byte_offset) {
 }
 
 float3 yuv_to_rgb(uint y, uint u, uint v) {
-    float3 f = (float3(y, u, v) / 255 -
-                float3(range.x, range.z, range.z)) *
-               float3(range.y, 2 * range.w, 2 * range.w) - float3(0, 1, 1);
+    float3 f = (float3(y, u, v) / 255 - float3(range.x, range.z, range.z))
+         * float3(range.y, 2 * range.w, 2 * range.w)
+         - float3(0, 1, 1);
     return saturate(float3(
         f.x + f.z * (1 - k.x),
-        f.x - f.y * (1 - k.z) * k.z / k.y -
-            f.z * (1 - k.x) * k.x / k.y,
+        f.x - f.y * (1 - k.z) * k.z / k.y - f.z * (1 - k.x) * k.x / k.y,
         f.x + f.y * (1 - k.z)));
 }
 
+uint pack_bgra_rgb(float3 rgb) {
+    uint3 bgra = uint3(round(255 * rgb.zyx));
+    return bgra.x | (bgra.y << 8) | (bgra.z << 16) | 0xff000000;
+}
+
 uint pack_bgra_pixel(uint y, uint u, uint v) {
-    uint3 rgb = uint3(round(255 * yuv_to_rgb(y, u, v).zyx));
-    return rgb.x | (rgb.y << 8) | (rgb.z << 16) | 0xff000000;
+    return pack_bgra_rgb(yuv_to_rgb(y, u, v));
 }
 
 float3 rgb_to_yuv(uint3 q) {
@@ -99,7 +113,7 @@ float3 rgb_to_yuv(uint3 q) {
                   (vv / range.w / 2 + .5) * 255);
 }
 
-[numthreads(32, 2, 1)]
+[numthreads(8, 8, 1)]
 void nv12_to_bgra_frame(uint3 id : SV_DispatchThreadID) {
     uint2 pixel = id.xy * 2;
     if (pixel.x >= w || pixel.y >= h) return;
@@ -136,15 +150,40 @@ void i420_to_image2d(uint3 id : SV_DispatchThreadID) {
     OF[id.xy] = float4(yuv_to_rgb(load_byte(A, id.y * ys + id.x), load_byte(B, q.y * us + q.x), load_byte(C, q.y * vs + q.x)).zyx, 1);
 }
 
+void write_yuy2_pair(uint2 id, uint x, uint packed) {
+    uint y0 = packed & 255;
+    uint u = (packed >> 8) & 255;
+    uint y1 = (packed >> 16) & 255;
+    uint v = packed >> 24;
+
+    float2 luma = (float2(y0, y1) / 255 - range.xx) * range.yy;
+    float2 chroma = (float2(u, v) / 255 - range.zz) * (2 * range.ww) - 1;
+    float2 one_minus_k = 1 - k.xz;
+    float2 green = chroma * one_minus_k.yx * k.zx * inv_k_y;
+    float3 chroma_rgb = float3(
+        chroma.y * one_minus_k.x,
+        -green.x - green.y,
+        chroma.x * one_minus_k.y);
+
+    uint output = id.y * os + x;
+    O[output] = pack_bgra_rgb(saturate(luma.xxx + chroma_rgb));
+    O[output + 1] = pack_bgra_rgb(saturate(luma.yyy + chroma_rgb));
+}
+
 [numthreads(8, 8, 1)]
 void yuy2_to_bgra_frame(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= w || id.y >= h) return;
-    uint2 q = uint2(id.x / 2, id.y);
-    uint zp = id.y * ys + q.x * 4;
-    uint y = load_byte(A, zp + ((id.x & 1) ? 2 : 0));
-    uint u = load_byte(A, zp + 1);
-    uint v = load_byte(A, zp + 3);
-    O[id.y * os + id.x] = pack_bgra_pixel(y, u, v);
+    uint x = id.x * 2;
+    if (x >= w || id.y >= h) return;
+    uint packed = A.Load(id.y * ys + id.x * 4);
+    write_yuy2_pair(id.xy, x, packed);
+}
+
+[numthreads(8, 8, 1)]
+void yuy2_to_bgra_frame_unaligned(uint3 id : SV_DispatchThreadID) {
+    uint x = id.x * 2;
+    if (x >= w || id.y >= h) return;
+    uint packed = load_dword(A, id.y * ys + id.x * 4);
+    write_yuy2_pair(id.xy, x, packed);
 }
 
 [numthreads(8, 8, 1)]
@@ -169,8 +208,9 @@ struct GPUBuffer {
     ComPtr<ID3D11ShaderResourceView> srv;
     ComPtr<ID3D11UnorderedAccessView> uav;
 
-    GPUBuffer(size_t bytes, bool output = false,
-              DXGI_FORMAT format = DXGI_FORMAT_R8_UINT): bytes(bytes) {
+    GPUBuffer(size_t bytes, bool output = false, DXGI_FORMAT format = DXGI_FORMAT_R8_UINT)
+        : bytes(bytes) 
+    {
         D3D11_BUFFER_DESC d{};
         d.ByteWidth = (UINT)bytes;
         d.Usage = D3D11_USAGE_DEFAULT;
@@ -225,7 +265,8 @@ struct GPUOutputBuffer: GPUBuffer {
     bool mapped = false;
 
     GPUOutputBuffer(size_t bytes, DXGI_FORMAT format = DXGI_FORMAT_R8_UINT)
-        : GPUBuffer(bytes, true, format) {
+        : GPUBuffer(bytes, true, format) 
+    {
         D3D11_BUFFER_DESC staging_desc = {};
         staging_desc.ByteWidth = (UINT)bytes;
         staging_desc.Usage = D3D11_USAGE_STAGING;
@@ -289,7 +330,11 @@ struct GPUParamsBuffer {
 
 bool shader(const char *entry, ComPtr<ID3D11ComputeShader> &out) {
     ComPtr<ID3DBlob> b, e;
-    const UINT flags = strcmp(entry, "nv12_to_bgra_frame") == 0
+    const bool optimize =
+        strcmp(entry, "nv12_to_bgra_frame") == 0 ||
+        strcmp(entry, "yuy2_to_bgra_frame") == 0 ||
+        strcmp(entry, "yuy2_to_bgra_frame_unaligned") == 0;
+    const UINT flags = optimize
         ? D3DCOMPILE_OPTIMIZATION_LEVEL3
         : 0;
     HRESULT hr = D3DCompile(kShader, strlen(kShader), nullptr, nullptr, nullptr, entry,
@@ -306,7 +351,7 @@ bool shader(const char *entry, ComPtr<ID3D11ComputeShader> &out) {
 template<class T>
 class BufPool {
 public:
-    explicit BufPool(size_t threshold) : threshold_(threshold) {}
+    BufPool(size_t threshold) : threshold_(threshold) {}
 
     std::shared_ptr<T> Load(const void *data, UINT bytes) {
         auto ret = Aquire(bytes);
@@ -326,13 +371,12 @@ public:
         });
     }
 
-
 private:
     std::multimap<size_t, T> pool_;
     std::multimap<size_t, T> oldpool_;
     std::mutex pool_mutex_;
     size_t bytes_ = 0;
-    size_t threshold_;
+    size_t threshold_ = 8 * 1024 * 1024; // buffer到达多少字节之后开始清理过期数据
 
     T Acquire_(UINT bytes) {
         std::unique_lock<std::mutex> lock(pool_mutex_);
@@ -367,6 +411,7 @@ private:
         pool_.emplace(bytes, std::move(buf));
         bytes_ += bytes;
 
+        // 判断是否触发过期数据清理
         if (bytes_ > threshold_) {
             oldpool_.clear();
             oldpool_.swap(pool_);
@@ -394,7 +439,7 @@ bool copyback(GPUOutputBuffer &x, void *dst, UINT bytes) {
 
 
 bool copyback_bgra(GPUOutputBuffer &x, void *dst, UINT dst_stride, UINT w, UINT h) {
-    if (!x.buffer || !x.staging || dst_stride < w * 4)
+    if (!x.buffer || !x.staging)
         return false;
     auto ptr = static_cast<const unsigned char *>(x.MapBuffer());
     if (!ptr)
@@ -420,6 +465,7 @@ void params(const asco::ColorInfo &ci, Params &p, UINT w, UINT h) {
     p.k[0] = ci.trans_matrix == asco::ColorTransMatrix::BT601 ? .299f : .2126f;
     p.k[1] = ci.trans_matrix == asco::ColorTransMatrix::BT601 ? .587f : .7152f;
     p.k[2] = ci.trans_matrix == asco::ColorTransMatrix::BT601 ? .114f : .0722f;
+    p.inv_k_y = 1.f / p.k[1];
     p.range[0] = ci.nominal_range == asco::ColorNominalRange::_0_255 ? 0 : 16.f / 255;
     p.range[1] = ci.nominal_range == asco::ColorNominalRange::_0_255 ? 1 : 255.f / 219;
     p.range[2] = p.range[0];
@@ -429,7 +475,7 @@ void params(const asco::ColorInfo &ci, Params &p, UINT w, UINT h) {
 }
 
 
-bool run(ComPtr<ID3D11ComputeShader> &cs, const GPUBuffer *a, const GPUBuffer *b,
+bool run_shader(ComPtr<ID3D11ComputeShader> &cs, const GPUBuffer *a, const GPUBuffer *b,
          const GPUBuffer *c, const GPUBuffer *o, const GPUBuffer *oy,
          const GPUBuffer *ou, const GPUBuffer *ov,
          const GPUParamsBuffer *params_buffer, UINT w, UINT h, UINT group_width = 8,
@@ -458,21 +504,6 @@ bool run(ComPtr<ID3D11ComputeShader> &cs, const GPUBuffer *a, const GPUBuffer *b
     g_ctx->CSSetShaderResources(0, 3, zs);
     g_ctx->CSSetUnorderedAccessViews(0, 4, zu, nullptr);
     return true;
-}
-
-
-bool size_to_uint(size_t value, UINT &result) {
-    if (value > (std::numeric_limits<UINT>::max)())
-        return false;
-    result = static_cast<UINT>(value);
-    return true;
-}
-
-
-bool product_to_uint(size_t a, size_t b, UINT &result) {
-    if (a != 0 && b > (std::numeric_limits<UINT>::max)() / a)
-        return false;
-    return size_to_uint(a * b, result);
 }
 
 
@@ -526,6 +557,7 @@ void init_d3d11_colorconv(void *d) {
     shader("i420_to_bgra_frame", g_i420_to_bgra);
     shader("i420_to_image2d", g_i420_to_image2d);
     shader("yuy2_to_bgra_frame", g_yuy2_to_bgra);
+    shader("yuy2_to_bgra_frame_unaligned", g_yuy2_to_bgra_unaligned);
     shader("bgra_to_i420_frame", g_bgra_to_i420);
 }
 
@@ -533,7 +565,7 @@ void init_d3d11_colorconv(void *d) {
 bool is_d3d11_colorconv_avail() {
     return g_enabled && g_dev && g_ctx &&
            g_nv12_to_bgra && g_i420_to_bgra && g_i420_to_image2d &&
-           g_yuy2_to_bgra && g_bgra_to_i420;
+           g_yuy2_to_bgra && g_yuy2_to_bgra_unaligned && g_bgra_to_i420;
 }
 
 
@@ -546,17 +578,12 @@ bool d3d11_nv12_to_bgra_frame(const asco::ColorInfo &ci, size_t w, size_t h, voi
                               const void *y, size_t ys, const void *uv, size_t us) {
     if (!is_d3d11_colorconv_avail() || !d || !y || !uv || w < 2 || h < 2 || (w & 1) || (h & 1))
         return false;
-    UINT width, height, y_stride, uv_stride, output_stride;
-    UINT y_bytes, uv_bytes, output_bytes;
-    if (!size_to_uint(w, width) || !size_to_uint(h, height) ||
-        !size_to_uint(ys, y_stride) || !size_to_uint(us, uv_stride) ||
-        !size_to_uint(ds, output_stride) || ys < w || us < w ||
-        w > (std::numeric_limits<UINT>::max)() / 4 || ds < w * 4 ||
-        !product_to_uint(ys, h, y_bytes) ||
-        !product_to_uint(us, h / 2, uv_bytes) ||
-        !product_to_uint(w * 4, h, output_bytes)) {
-        return false;
-    }
+    const UINT width = (UINT)w, height = (UINT)h;
+    const UINT y_stride = (UINT)ys, uv_stride = (UINT)us;
+    const UINT output_stride = (UINT)ds;
+    const UINT y_bytes = (UINT)(ys * h);
+    const UINT uv_bytes = (UINT)(us * (h / 2));
+    const UINT output_bytes = (UINT)(w * 4 * h);
     auto a = g_input_pool.Load(y, y_bytes);
     auto b = g_input_pool.Load(uv, uv_bytes);
     auto o = g_packed_output_pool.Aquire(output_bytes);
@@ -570,8 +597,7 @@ bool d3d11_nv12_to_bgra_frame(const asco::ColorInfo &ci, size_t w, size_t h, voi
     auto params_buffer = g_params_pool.Load(&p, sizeof(p));
     if (!params_buffer || !params_buffer->buffer)
         return false;
-    bool ok = run(g_nv12_to_bgra, a.get(), b.get(), nullptr, o.get(), nullptr, nullptr, nullptr,
-                  params_buffer.get(), width / 2, height / 2, 32, 2) &&
+    bool ok = run_shader(g_nv12_to_bgra, a.get(), b.get(), nullptr, o.get(), nullptr, nullptr, nullptr, params_buffer.get(), width / 2, height / 2) &&
               copyback_bgra(*o, d, output_stride, width, height);
     return ok;
 }
@@ -582,25 +608,18 @@ bool d3d11_i420_to_bgra_frame(const asco::ColorInfo &ci, size_t w, size_t h, con
                               void *d, size_t ds) {
     if (!is_d3d11_colorconv_avail() || !d || !y || !u || !v || w < 2 || h < 2 || (w & 1) || (h & 1))
         return false;
-    UINT width, height, y_stride, u_stride, v_stride, output_stride;
-    UINT y_bytes, u_bytes, v_bytes, output_bytes;
-    if (!size_to_uint(w, width) || !size_to_uint(h, height) ||
-        !size_to_uint(ys, y_stride) || !size_to_uint(us, u_stride) ||
-        !size_to_uint(vs, v_stride) || !size_to_uint(ds, output_stride) ||
-        ys < w || us < w / 2 || vs < w / 2 ||
-        w > (std::numeric_limits<UINT>::max)() / 4 || ds < w * 4 ||
-        !product_to_uint(ys, h, y_bytes) ||
-        !product_to_uint(us, h / 2, u_bytes) ||
-        !product_to_uint(vs, h / 2, v_bytes) ||
-        !product_to_uint(w * 4, h, output_bytes)) {
-        return false;
-    }
+    const UINT width = (UINT)w, height = (UINT)h;
+    const UINT y_stride = (UINT)ys, u_stride = (UINT)us;
+    const UINT v_stride = (UINT)vs, output_stride = (UINT)ds;
+    const UINT y_bytes = (UINT)(ys * h);
+    const UINT u_bytes = (UINT)(us * (h / 2));
+    const UINT v_bytes = (UINT)(vs * (h / 2));
+    const UINT output_bytes = (UINT)(w * 4 * h);
     auto a = g_input_pool.Load(y, y_bytes);
     auto b = g_input_pool.Load(u, u_bytes);
     auto c = g_input_pool.Load(v, v_bytes);
     auto o = g_packed_output_pool.Aquire(output_bytes);
-    if (!a || !b || !c || !o ||
-        !a->buffer || !b->buffer || !c->buffer || !o->buffer)
+    if (!a || !b || !c || !o || !a->buffer || !b->buffer || !c->buffer || !o->buffer)
         return false;
     Params p;
     params(ci, p, width, height);
@@ -611,8 +630,7 @@ bool d3d11_i420_to_bgra_frame(const asco::ColorInfo &ci, size_t w, size_t h, con
     auto params_buffer = g_params_pool.Load(&p, sizeof(p));
     if (!params_buffer || !params_buffer->buffer)
         return false;
-    bool ok = run(g_i420_to_bgra, a.get(), b.get(), c.get(), o.get(), nullptr, nullptr, nullptr,
-                  params_buffer.get(), width, height) &&
+    bool ok = run_shader(g_i420_to_bgra, a.get(), b.get(), c.get(), o.get(), nullptr, nullptr, nullptr, params_buffer.get(), width, height) &&
               copyback_bgra(*o, d, output_stride, width, height);
     return ok;
 }
@@ -622,16 +640,10 @@ bool d3d11_yuy2_to_bgra_frame(const asco::ColorInfo &ci, size_t w, size_t h, con
                               size_t ss, void *d, size_t ds) {
     if (!is_d3d11_colorconv_avail() || !s || !d || w < 2 || h < 1 || (w & 1))
         return false;
-    UINT width, height, source_stride, output_stride;
-    UINT source_bytes, output_bytes;
-    if (!size_to_uint(w, width) || !size_to_uint(h, height) ||
-        !size_to_uint(ss, source_stride) || !size_to_uint(ds, output_stride) ||
-        w > (std::numeric_limits<UINT>::max)() / 4 ||
-        ss < w * 2 || ds < w * 4 ||
-        !product_to_uint(ss, h, source_bytes) ||
-        !product_to_uint(w * 4, h, output_bytes)) {
-        return false;
-    }
+    const UINT width = (UINT)w, height = (UINT)h;
+    const UINT source_stride = (UINT)ss, output_stride = (UINT)ds;
+    const UINT source_bytes = (UINT)(ss * h);
+    const UINT output_bytes = (UINT)(w * 4 * h);
     auto a = g_input_pool.Load(s, source_bytes);
     auto o = g_packed_output_pool.Aquire(output_bytes);
     if (!a || !o || !a->buffer || !o->buffer)
@@ -643,8 +655,10 @@ bool d3d11_yuy2_to_bgra_frame(const asco::ColorInfo &ci, size_t w, size_t h, con
     auto params_buffer = g_params_pool.Load(&p, sizeof(p));
     if (!params_buffer || !params_buffer->buffer)
         return false;
-    bool ok = run(g_yuy2_to_bgra, a.get(), nullptr, nullptr, o.get(), nullptr, nullptr, nullptr,
-                  params_buffer.get(), width, height) &&
+    auto &yuy2_shader = (source_stride & 3)
+        ? g_yuy2_to_bgra_unaligned
+        : g_yuy2_to_bgra;
+    bool ok = run_shader(yuy2_shader, a.get(), nullptr, nullptr, o.get(), nullptr, nullptr, nullptr, params_buffer.get(), width / 2, height) &&
               copyback_bgra(*o, d, output_stride, width, height);
     return ok;
 }
@@ -671,8 +685,7 @@ bool d3d11_bgra_to_i420_frame(const asco::ColorInfo &ci, size_t w, size_t h, con
     auto params_buffer = g_params_pool.Load(&p, sizeof(p));
     if (!params_buffer || !params_buffer->buffer)
         return false;
-    bool ok = run(g_bgra_to_i420, a.get(), nullptr, nullptr, nullptr, oy.get(), ou.get(), ov.get(),
-                  params_buffer.get(), (UINT)w, (UINT)h) &&
+    bool ok = run_shader(g_bgra_to_i420, a.get(), nullptr, nullptr, nullptr, oy.get(), ou.get(), ov.get(), params_buffer.get(), (UINT)w, (UINT)h) &&
               copyback(*oy, y, (UINT)(ys * h)) &&
               copyback(*ou, u, (UINT)(us * (h / 2))) &&
               copyback(*ov, v, (UINT)(vs * (h / 2)));

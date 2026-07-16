@@ -127,6 +127,10 @@ bool convert(const asco::ColorInfo& color_info,
     return d3d11_nv12_to_bgra_frame(color_info, width, height,
                                     output.data(), width * 4,
                                     y, width, uv, width);
+#elif defined(BENCHMARK_D3D12)
+    return d3d12_nv12_to_bgra_frame(color_info, width, height,
+                                    output.data(), width * 4,
+                                    y, width, uv, width);
 #elif defined(BENCHMARK_OPENCL)
     return opencl_nv12_to_bgra_frame(color_info, width, height,
                                      output.data(), width * 4,
@@ -145,6 +149,11 @@ int main(int argc, char** argv) {
         init_d3d11_colorconv(device.Get());
         if (!is_d3d11_colorconv_avail()) {
             throw std::runtime_error("D3D11 color conversion initialization failed");
+        }
+#elif defined(BENCHMARK_D3D12)
+        init_d3d12_colorconv(device.Get());
+        if (!is_d3d12_colorconv_avail()) {
+            throw std::runtime_error("D3D12 color conversion initialization failed");
         }
 #elif defined(BENCHMARK_OPENCL)
         init_opencl(device.Get());
@@ -189,8 +198,11 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("Failed to write output file");
         }
 
-        std::cout << "Backend:    " << BENCHMARK_BACKEND_NAME << '\n'
-                  << "Resolution: " << options.width << 'x' << options.height << " NV12 -> BGRA\n"
+        std::cout << "Backend:    " << BENCHMARK_BACKEND_NAME << '\n';
+#if defined(BENCHMARK_D3D12)
+        std::cout << "Transfer:   " << d3d12_colorconv_transfer_mode() << '\n';
+#endif
+        std::cout << "Resolution: " << options.width << 'x' << options.height << " NV12 -> BGRA\n"
                   << "Frames:     " << frames << '\n'
                   << std::fixed << std::setprecision(3)
                   << "Elapsed:    " << elapsed << " s\n"
