@@ -50,39 +50,39 @@ cbuffer P : register(b0) {
     uint2 reserved;
 }
 
-Buffer<uint> A : register(t0);
-Buffer<uint> B : register(t1);
-Buffer<uint> C : register(t2);
+ByteAddressBuffer A : register(t0);
+ByteAddressBuffer B : register(t1);
+ByteAddressBuffer C : register(t2);
 RWBuffer<uint> O : register(u0);
 RWBuffer<uint> OY : register(u1);
 RWBuffer<uint> OU : register(u2);
 RWBuffer<uint> OV : register(u3);
 RWTexture2D<float4> OF : register(u0);
 
-uint load_byte(Buffer<uint> buffer, uint byte_offset) {
-    uint packed = buffer[byte_offset >> 2];
+uint load_byte(ByteAddressBuffer buffer, uint byte_offset) {
+    uint packed = buffer.Load(byte_offset & ~3);
     return (packed >> ((byte_offset & 3) * 8)) & 255;
 }
 
-uint load_dword(Buffer<uint> buffer, uint byte_offset) {
-    uint element = byte_offset >> 2;
-    uint low = buffer[element];
+uint load_dword(ByteAddressBuffer buffer, uint byte_offset) {
+    uint aligned_offset = byte_offset & ~3;
+    uint low = buffer.Load(aligned_offset);
     uint shift = (byte_offset & 3) * 8;
     if (shift == 0)
         return low;
-    uint high = buffer[element + 1];
+    uint high = buffer.Load(aligned_offset + 4);
     return (low >> shift) | (high << (32 - shift));
 }
 
-uint2 load_two_bytes(Buffer<uint> buffer, uint byte_offset) {
+uint2 load_two_bytes(ByteAddressBuffer buffer, uint byte_offset) {
     uint lane = byte_offset & 3;
-    uint element = byte_offset >> 2;
-    uint packed = buffer[element];
+    uint aligned_offset = byte_offset & ~3;
+    uint packed = buffer.Load(aligned_offset);
     if (lane < 3) {
         uint pair = (packed >> (lane * 8)) & 0xffff;
         return uint2(pair & 255, pair >> 8);
     }
-    return uint2(packed >> 24, buffer[element + 1] & 255);
+    return uint2(packed >> 24, buffer.Load(aligned_offset + 4) & 255);
 }
 
 float3 yuv_to_rgb(uint y, uint u, uint v) {
@@ -175,7 +175,7 @@ void write_yuy2_pair(uint2 id, uint x, uint packed) {
 void yuy2_to_bgra_frame(uint3 id : SV_DispatchThreadID) {
     uint x = id.x * 2;
     if (x >= w || id.y >= h) return;
-    uint packed = A[(id.y * ys >> 2) + id.x];
+    uint packed = A.Load(id.y * ys + id.x * 4);
     write_yuy2_pair(id.xy, x, packed);
 }
 
@@ -221,6 +221,7 @@ struct GPUBuffer {
         d.Usage = D3D11_USAGE_DEFAULT;
 #endif
         d.BindFlags = output ? D3D11_BIND_UNORDERED_ACCESS : D3D11_BIND_SHADER_RESOURCE;
+        d.MiscFlags = output ? 0 : D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
         if (FAILED(g_dev->CreateBuffer(&d, nullptr, &buffer)))
             return;
         if (output) {
@@ -234,9 +235,10 @@ struct GPUBuffer {
                 buffer.Reset();
         } else {
             D3D11_SHADER_RESOURCE_VIEW_DESC v{};
-            v.Format = DXGI_FORMAT_R32_UINT;
-            v.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-            v.Buffer.NumElements = d.ByteWidth / sizeof(UINT);
+            v.Format = DXGI_FORMAT_R32_TYPELESS;
+            v.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+            v.BufferEx.NumElements = d.ByteWidth / sizeof(UINT);
+            v.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
             if (FAILED(g_dev->CreateShaderResourceView(buffer.Get(), &v, &srv)))
                 buffer.Reset();
         }
