@@ -36,9 +36,17 @@ function(configure_benchmark target backend_name backend_define)
     endif()
 endfunction()
 
-add_executable(compare_d3d11_r8 src/main.cpp "${BACKEND_DIR}/cc_d3d11.cpp")
-configure_benchmark(compare_d3d11_r8 "D3D11 (current colorconv)" BENCHMARK_D3D11)
-target_link_libraries(compare_d3d11_r8 PRIVATE d3dcompiler)
+add_executable(compare_d3d11 src/main.cpp "${BACKEND_DIR}/cc_d3d11.cpp")
+configure_benchmark(compare_d3d11 "D3D11 (current colorconv)" BENCHMARK_D3D11)
+target_link_libraries(compare_d3d11 PRIVATE d3dcompiler)
+
+add_executable(compare_d3d11_dynamic
+    src/main.cpp "${BACKEND_DIR}/cc_d3d11.cpp")
+configure_benchmark(compare_d3d11_dynamic
+    "D3D11 (dynamic WRITE_DISCARD upload)" BENCHMARK_D3D11)
+target_compile_definitions(compare_d3d11_dynamic PRIVATE
+    D3D11_DYNAMIC_INPUT_UPLOAD=1)
+target_link_libraries(compare_d3d11_dynamic PRIVATE d3dcompiler)
 
 add_executable(compare_d3d11on12 src/main.cpp "${BACKEND_DIR}/cc_d3d11.cpp")
 configure_benchmark(compare_d3d11on12 "D3D11On12 (current colorconv)" BENCHMARK_D3D11ON12)
