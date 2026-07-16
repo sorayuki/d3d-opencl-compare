@@ -4,7 +4,7 @@
 
 #include "color_types.h"
 
-#if defined(BENCHMARK_D3D11)
+#if defined(BENCHMARK_D3D11) || defined(BENCHMARK_D3D11ON12)
 void init_d3d11_colorconv(void* device);
 bool is_d3d11_colorconv_avail();
 bool d3d11_nv12_to_bgra_frame(

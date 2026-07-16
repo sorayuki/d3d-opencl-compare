@@ -40,6 +40,10 @@ add_executable(compare_d3d11_r8 src/main.cpp "${BACKEND_DIR}/cc_d3d11.cpp")
 configure_benchmark(compare_d3d11_r8 "D3D11 (current colorconv)" BENCHMARK_D3D11)
 target_link_libraries(compare_d3d11_r8 PRIVATE d3dcompiler)
 
+add_executable(compare_d3d11on12 src/main.cpp "${BACKEND_DIR}/cc_d3d11.cpp")
+configure_benchmark(compare_d3d11on12 "D3D11On12 (current colorconv)" BENCHMARK_D3D11ON12)
+target_link_libraries(compare_d3d11on12 PRIVATE d3d12 d3dcompiler)
+
 add_executable(compare_d3d12 src/main.cpp "${BACKEND_DIR}/cc_d3d12.cpp")
 configure_benchmark(compare_d3d12 "D3D12" BENCHMARK_D3D12)
 target_link_libraries(compare_d3d12 PRIVATE d3d12 d3dcompiler)

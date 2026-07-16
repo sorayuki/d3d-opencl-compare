@@ -1,6 +1,10 @@
 #include "backend_api.h"
 
 #include <d3d11.h>
+#if defined(BENCHMARK_D3D11ON12)
+#include <d3d11on12.h>
+#include <d3d12.h>
+#endif
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -68,7 +72,16 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-ComPtr<ID3D11Device> create_device() {
+struct BenchmarkDevice {
+    ComPtr<ID3D11Device> d3d11;
+#if defined(BENCHMARK_D3D11ON12)
+    ComPtr<ID3D12Device> d3d12;
+    ComPtr<ID3D12CommandQueue> queue;
+#endif
+};
+
+BenchmarkDevice create_device() {
+    BenchmarkDevice result;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     D3D_FEATURE_LEVEL feature_level{};
@@ -77,20 +90,51 @@ ComPtr<ID3D11Device> create_device() {
         D3D_FEATURE_LEVEL_11_0,
     };
 
-    HRESULT result = D3D11CreateDevice(
+#if defined(BENCHMARK_D3D11ON12)
+    HRESULT hr = D3D12CreateDevice(
+        nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&result.d3d12));
+    if (FAILED(hr)) {
+        throw std::runtime_error("D3D12 hardware device creation failed (HRESULT " +
+                                 std::to_string(static_cast<unsigned long>(hr)) + ")");
+    }
+
+    D3D12_COMMAND_QUEUE_DESC queue_description{};
+    queue_description.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    hr = result.d3d12->CreateCommandQueue(
+        &queue_description, IID_PPV_ARGS(&result.queue));
+    if (FAILED(hr)) {
+        throw std::runtime_error("D3D12 command queue creation failed (HRESULT " +
+                                 std::to_string(static_cast<unsigned long>(hr)) + ")");
+    }
+
+    IUnknown* queues[] = {result.queue.Get()};
+    hr = D3D11On12CreateDevice(
+        result.d3d12.Get(), 0, levels, static_cast<UINT>(std::size(levels)),
+        queues, static_cast<UINT>(std::size(queues)), 0, &device, &context,
+        &feature_level);
+    if (hr == E_INVALIDARG) {
+        hr = D3D11On12CreateDevice(
+            result.d3d12.Get(), 0, levels + 1, 1, queues,
+            static_cast<UINT>(std::size(queues)), 0, &device, &context,
+            &feature_level);
+    }
+#else
+    HRESULT hr = D3D11CreateDevice(
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels,
         static_cast<UINT>(std::size(levels)), D3D11_SDK_VERSION,
         &device, &feature_level, &context);
-    if (result == E_INVALIDARG) {
-        result = D3D11CreateDevice(
+    if (hr == E_INVALIDARG) {
+        hr = D3D11CreateDevice(
             nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels + 1, 1,
             D3D11_SDK_VERSION, &device, &feature_level, &context);
     }
-    if (FAILED(result)) {
+#endif
+    if (FAILED(hr)) {
         throw std::runtime_error("D3D11 hardware device creation failed (HRESULT " +
-                                 std::to_string(static_cast<unsigned long>(result)) + ")");
+                                 std::to_string(static_cast<unsigned long>(hr)) + ")");
     }
-    return device;
+    result.d3d11 = std::move(device);
+    return result;
 }
 
 asco::ColorInfo make_color_info() {
@@ -123,7 +167,7 @@ bool convert(const asco::ColorInfo& color_info,
              std::vector<unsigned char>& output, std::size_t width, std::size_t height) {
     const void* y = input.data();
     const void* uv = input.data() + width * height;
-#if defined(BENCHMARK_D3D11)
+#if defined(BENCHMARK_D3D11) || defined(BENCHMARK_D3D11ON12)
     return d3d11_nv12_to_bgra_frame(color_info, width, height,
                                     output.data(), width * 4,
                                     y, width, uv, width);
@@ -145,18 +189,18 @@ int main(int argc, char** argv) {
         const Options options = parse_options(argc, argv);
         const auto device = create_device();
 
-#if defined(BENCHMARK_D3D11)
-        init_d3d11_colorconv(device.Get());
+#if defined(BENCHMARK_D3D11) || defined(BENCHMARK_D3D11ON12)
+        init_d3d11_colorconv(device.d3d11.Get());
         if (!is_d3d11_colorconv_avail()) {
             throw std::runtime_error("D3D11 color conversion initialization failed");
         }
 #elif defined(BENCHMARK_D3D12)
-        init_d3d12_colorconv(device.Get());
+        init_d3d12_colorconv(device.d3d11.Get());
         if (!is_d3d12_colorconv_avail()) {
             throw std::runtime_error("D3D12 color conversion initialization failed");
         }
 #elif defined(BENCHMARK_OPENCL)
-        init_opencl(device.Get());
+        init_opencl(device.d3d11.Get());
         if (!is_opencl_avail()) {
             throw std::runtime_error(
                 "No OpenCL device with D3D11 sharing support is available");
