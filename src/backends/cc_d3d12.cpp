@@ -2,6 +2,7 @@
 
 #include <d3d11.h>
 #include <d3d12.h>
+#include "../d3d12_resource_helpers.h"
 #include <d3dcompiler.h>
 #include <dxgi.h>
 #include <windows.h>
@@ -700,32 +701,7 @@ bool supports_gpu_upload_heap(ID3D12Device* device) {
 }
 
 bool supports_direct_mapped_output(ID3D12Device* device) {
-    D3D12_FEATURE_DATA_ARCHITECTURE architecture{};
-    architecture.NodeIndex = 0;
-    if (FAILED(device->CheckFeatureSupport(
-            D3D12_FEATURE_ARCHITECTURE, &architecture,
-            sizeof(architecture))) || !architecture.UMA) {
-        return false;
-    }
-
-    const auto heap = shared_output_heap_properties();
-    const auto description = buffer_description(
-        sizeof(UINT), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-    ComPtr<ID3D12Resource> probe;
-    if (FAILED(device->CreateCommittedResource(
-            &heap, D3D12_HEAP_FLAG_NONE, &description,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-            IID_PPV_ARGS(&probe)))) {
-        return false;
-    }
-
-    void* mapped = nullptr;
-    const D3D12_RANGE read_range{0, 0};
-    if (FAILED(probe->Map(0, &read_range, &mapped)) || !mapped)
-        return false;
-    const D3D12_RANGE written_range{0, 0};
-    probe->Unmap(0, &written_range);
-    return true;
+    return d3d12_common::supports_uma_write_back(device);
 }
 
 }  // namespace

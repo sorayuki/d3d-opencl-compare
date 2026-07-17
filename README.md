@@ -10,6 +10,7 @@
 - `compare_d3d11`：使用 D3D11 实现
 - `compare_d3d11_dynamic`：使用 `WRITE_DISCARD` 动态上传的 D3D11 实现
 - `compare_d3d11on12`：通过 D3D11On12 在 D3D12 设备和命令队列上运行 D3D11 实现
+- `compare_d3d11on12_uma`：在 D3D11 backend 中通过 D3D11On12 wrapped D3D12 resource 使用 UMA 输出
 - `compare_d3d12`：原生 D3D12 compute 实现
 - `compare_d3d12_upload_copy`：使用 `UPLOAD -> DEFAULT` 输入拷贝的 D3D12 实现
 
@@ -47,6 +48,7 @@ cmake --build build --config Release -j
 .\build\Release\compare_opencl.exe --seconds 10 --warmup 20
 .\build\Release\compare_d3d11.exe --seconds 10 --warmup 20
 .\build\Release\compare_d3d11on12.exe --seconds 10 --warmup 20
+.\build\Release\compare_d3d11on12_uma.exe --seconds 10 --warmup 20
 .\build\Release\compare_d3d12.exe --seconds 10 --warmup 20
 ```
 

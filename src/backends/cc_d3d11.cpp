@@ -1,6 +1,11 @@
 #include "cc_d3d11.h"
 #include <cstring>
 #include <d3d11.h>
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+#include <d3d11on12.h>
+#include <d3d12.h>
+#include "../d3d12_resource_helpers.h"
+#endif
 #include <d3dcompiler.h>
 #include <string>
 #include <map>
@@ -24,6 +29,12 @@ ComPtr<ID3D11ComputeShader> g_i420_to_image2d, g_yuy2_to_bgra;
 ComPtr<ID3D11ComputeShader> g_yuy2_to_bgra_unaligned;
 ComPtr<ID3D11ComputeShader> g_bgra_to_i420;
 bool g_enabled = true;
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+ComPtr<ID3D11On12Device1> g_on12;
+ComPtr<ID3D12Device> g_d3d12;
+ComPtr<ID3D11Query> g_completion_query;
+bool g_direct_output = false;
+#endif
 
 
 struct Params {
@@ -305,10 +316,48 @@ struct GPUBuffer {
 struct GPUOutputBuffer: GPUBuffer {
     ComPtr<ID3D11Buffer> staging;
     bool mapped = false;
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+    ComPtr<ID3D12Resource> direct_resource;
+    void* direct_mapped = nullptr;
+    bool direct = false;
+#endif
 
     GPUOutputBuffer(size_t bytes, DXGI_FORMAT format = DXGI_FORMAT_R8_UINT)
         : GPUBuffer(bytes, true, format) 
     {
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+        if (g_direct_output && format == DXGI_FORMAT_R8_UINT) {
+            if (d3d12_common::create_write_back_buffer(g_d3d12.Get(), bytes,
+                                                       direct_resource,
+                                                       direct_mapped)) {
+                D3D11_RESOURCE_FLAGS flags{};
+                flags.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+                flags.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+                ComPtr<ID3D11Buffer> wrapped;
+                if (SUCCEEDED(g_on12->CreateWrappedResource(
+                        direct_resource.Get(), &flags,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        IID_PPV_ARGS(&wrapped)))) {
+                    D3D11_UNORDERED_ACCESS_VIEW_DESC view{};
+                    view.Format = DXGI_FORMAT_R32_TYPELESS;
+                    view.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+                    view.Buffer.NumElements = static_cast<UINT>(bytes / 4);
+                    view.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+                    ComPtr<ID3D11UnorderedAccessView> wrapped_uav;
+                    if (SUCCEEDED(g_dev->CreateUnorderedAccessView(
+                            wrapped.Get(), &view, &wrapped_uav))) {
+                        buffer = std::move(wrapped);
+                        uav = std::move(wrapped_uav);
+                        direct = true;
+                        return;
+                    }
+                }
+                direct_resource.Reset();
+                direct_mapped = nullptr;
+            }
+        }
+#endif
         D3D11_BUFFER_DESC staging_desc = {};
         staging_desc.ByteWidth = (UINT)bytes;
         staging_desc.Usage = D3D11_USAGE_STAGING;
@@ -324,6 +373,18 @@ struct GPUOutputBuffer: GPUBuffer {
     }
 
     void* MapBuffer() {
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+        if (direct) {
+            if (g_completion_query) {
+                g_ctx->End(g_completion_query.Get());
+                g_ctx->Flush();
+                while (g_ctx->GetData(g_completion_query.Get(), nullptr, 0,
+                                      D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE)
+                    YieldProcessor();
+            }
+            return direct_mapped;
+        }
+#endif
         if (!buffer || !staging || mapped)
             return nullptr;
         g_ctx->CopyResource(staging.Get(), buffer.Get());
@@ -335,6 +396,10 @@ struct GPUOutputBuffer: GPUBuffer {
     }
 
     void UnmapBuffer() {
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+        if (direct)
+            return;
+#endif
         if (!staging || !mapped)
             return;
         g_ctx->Unmap(staging.Get(), 0);
@@ -539,8 +604,22 @@ bool run_shader(ComPtr<ID3D11ComputeShader> &cs, const GPUBuffer *a, const GPUBu
     g_ctx->CSSetConstantBuffers(0, 1, &constant_buffer);
     g_ctx->CSSetShaderResources(0, 3, sv);
     g_ctx->CSSetUnorderedAccessViews(0, 4, uv, nullptr);
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+    ID3D11Resource* wrapped_resource = nullptr;
+    if (g_direct_output && o) {
+        auto* output = static_cast<const GPUOutputBuffer*>(o);
+        if (output->direct) {
+            wrapped_resource = output->buffer.Get();
+            g_on12->AcquireWrappedResources(&wrapped_resource, 1);
+        }
+    }
+#endif
     g_ctx->Dispatch((w + group_width - 1) / group_width,
                     (h + group_height - 1) / group_height, 1);
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+    if (wrapped_resource)
+        g_on12->ReleaseWrappedResources(&wrapped_resource, 1);
+#endif
     ID3D11ShaderResourceView *zs[3] = {};
     ID3D11UnorderedAccessView *zu[4] = {};
     g_ctx->CSSetShaderResources(0, 3, zs);
@@ -573,6 +652,11 @@ void init_d3d11_colorconv(void *d) {
     D3D_FEATURE_LEVEL feature_level{};
     ComPtr<ID3D11Device> conversion_device;
     ComPtr<ID3D11DeviceContext> conversion_context;
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+    conversion_device = source_device;
+    source_device->GetImmediateContext(&conversion_context);
+    HRESULT hr = conversion_device && conversion_context ? S_OK : E_FAIL;
+#else
     HRESULT hr = D3D11CreateDevice(
         adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
         D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -586,6 +670,7 @@ void init_d3d11_colorconv(void *d) {
             D3D11_SDK_VERSION,
             &conversion_device, &feature_level, &conversion_context);
     }
+#endif
     if (FAILED(hr))
         return;
 
@@ -595,6 +680,14 @@ void init_d3d11_colorconv(void *d) {
 
     g_dev = std::move(conversion_device);
     g_ctx = std::move(conversion_context);
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+    if (SUCCEEDED(g_dev.As(&g_on12)) &&
+        SUCCEEDED(g_on12->GetD3D12Device(IID_PPV_ARGS(&g_d3d12))) &&
+        d3d12_common::supports_uma_write_back(g_d3d12.Get())) {
+        D3D11_QUERY_DESC query_desc{D3D11_QUERY_EVENT, 0};
+        g_direct_output = SUCCEEDED(g_dev->CreateQuery(&query_desc, &g_completion_query));
+    }
+#endif
     shader("nv12_to_bgra_frame", g_nv12_to_bgra);
     shader("i420_to_bgra_frame", g_i420_to_bgra);
     shader("i420_to_image2d", g_i420_to_image2d);

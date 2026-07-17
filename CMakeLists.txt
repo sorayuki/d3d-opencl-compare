@@ -52,6 +52,12 @@ add_executable(compare_d3d11on12 src/main.cpp "${BACKEND_DIR}/cc_d3d11.cpp")
 configure_benchmark(compare_d3d11on12 "D3D11On12 (current colorconv)" BENCHMARK_D3D11ON12)
 target_link_libraries(compare_d3d11on12 PRIVATE d3d12 d3dcompiler)
 
+add_executable(compare_d3d11on12_uma src/main.cpp "${BACKEND_DIR}/cc_d3d11.cpp")
+configure_benchmark(compare_d3d11on12_uma "D3D11On12 (D3D12 UMA output)" BENCHMARK_D3D11ON12)
+target_compile_definitions(compare_d3d11on12_uma PRIVATE D3D11ON12_UMA_DIRECT_OUTPUT=1)
+target_link_libraries(compare_d3d11on12_uma PRIVATE d3d12 d3dcompiler)
+
+
 add_executable(compare_d3d12 src/main.cpp "${BACKEND_DIR}/cc_d3d12.cpp")
 configure_benchmark(compare_d3d12 "D3D12" BENCHMARK_D3D12)
 target_link_libraries(compare_d3d12 PRIVATE d3d12 d3dcompiler)
