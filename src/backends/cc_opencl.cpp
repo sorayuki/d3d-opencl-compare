@@ -13,6 +13,10 @@
 #include <windows.h>
 
 #include <d3d11.h>
+#include <dxgi.h>
+#include <wrl/client.h>
+
+using Microsoft::WRL::ComPtr;
 
 namespace {
     ID3D11Device* shared_d3d11dev_ = nullptr;
@@ -23,6 +27,8 @@ namespace {
     cl::Context ctx_;
     cl::CommandQueue queue_;
     cl::Program program_;
+    std::string device_name_;
+    UINT preferred_vendor_id_ = 0;
     bool isClShareMemory_ = false;
     bool isClSvmSupported_ = false;
 
@@ -197,9 +203,20 @@ static void InitCLEnv() try {
 
     std::tuple<cl::Platform, cl::Device> selected;
 
-    // 选找到的第一个
+    // Prefer the OpenCL device from the same vendor as the D3D adapter.
     if (std::get<0>(selected)() == 0) {
-        if (!platdevlist.empty())
+        for (const auto& candidate : platdevlist) {
+            const auto vendor = std::get<1>(candidate).getInfo<CL_DEVICE_VENDOR>();
+            const bool nvidia = preferred_vendor_id_ == 0x10de &&
+                                vendor.find("NVIDIA") != std::string::npos;
+            const bool intel = preferred_vendor_id_ == 0x8086 &&
+                               vendor.find("Intel") != std::string::npos;
+            if (nvidia || intel) {
+                selected = candidate;
+                break;
+            }
+        }
+        if (std::get<0>(selected)() == 0 && !platdevlist.empty())
             selected = platdevlist.front();
     }
 
@@ -209,11 +226,11 @@ static void InitCLEnv() try {
     clPlat_ = std::get<0>(selected)();
     cl_context_properties ctxprops[] = {
         CL_CONTEXT_PLATFORM, (cl_context_properties)clPlat_(),
-        CL_CONTEXT_D3D11_DEVICE_KHR, (cl_context_properties)shared_d3d11dev_,
-        0, 0
+        0
     };
     ctx_ = cl::Context(cl::vector<cl::Device>{ std::get<1>(selected) }, ctxprops);
     queue_ = cl::CommandQueue{ ctx_, std::get<1>(selected), cl::QueueProperties::None };
+    device_name_ = std::get<1>(selected).getInfo<CL_DEVICE_NAME>();
     isClSvmSupported_ = std::get<1>(selected).getInfo<CL_DEVICE_SVM_CAPABILITIES>() > 0;
     if (isClSvmSupported_) {
         // 看看是不是真的支持 SVM。目前 x86 下 isClSvmSupported_ 是 true，但是实际上不支持。
@@ -246,7 +263,10 @@ static void InitCLEnv() try {
             float r = f.x + f.z * (1.0f - k.x);
             float g = f.x - f.y * (1.0f - k.z) * k.z / k.y - f.z * (1.0f - k.x) * k.x / k.y;
             float b = f.x + f.y * (1.0f - k.z);
-            return convert_uchar3_sat((float3)(r, g, b) * (float3)(255.0f));
+            // Match the D3D11 shader's round(255 * rgb) before narrowing to 8 bits.
+            // The unsuffixed conversion truncates on the OpenCL implementation used
+            // here, which made OpenCL output one code value lower for many pixels.
+            return convert_uchar3_sat_rte((float3)(r, g, b) * (float3)(255.0f));
         }
 
         uchar3 rgb2yuv(uchar3 rgb, float3 k, float4 yuvscale) {
@@ -254,7 +274,7 @@ static void InitCLEnv() try {
             float y = clamp(dot(f, k), 0.0f, 1.0f);
             float v = clamp((f.x - y) / (1.0f - k.x), -1.0f, 1.0f);
             float u = clamp((f.z - y) / (1.0f - k.z), -1.0f, 1.0f);
-            return convert_uchar3_sat((float3)(
+            return convert_uchar3_sat_rte((float3)(
                 y / yuvscale.y + yuvscale.x,
                 u / yuvscale.w / 2.0f + 0.5f,
                 v / yuvscale.w / 2.0f + 0.5f
@@ -264,7 +284,7 @@ static void InitCLEnv() try {
         uchar rgb2y(uchar3 rgb, float3 k, float4 yuvscale) {
             float3 f = convert_float3(rgb) / (float3)(255.0f);
             float y = clamp(dot(f, k), 0.0f, 1.0f);
-            return convert_uchar_sat((y / yuvscale.y + yuvscale.x) * 255.0f);
+            return convert_uchar_sat_rte((y / yuvscale.y + yuvscale.x) * 255.0f);
         }
 
         kernel void bgra_to_i420_frame(
@@ -451,6 +471,16 @@ std::tuple<cl_float3, cl_float4> GetConvConst(const asco::ColorInfo& ci) {
 
 void init_opencl(void* d3d11Dev) {
     shared_d3d11dev_ = (ID3D11Device*)d3d11Dev;
+    preferred_vendor_id_ = 0;
+    if (shared_d3d11dev_) {
+        ComPtr<IDXGIDevice> dxgi_device;
+        ComPtr<IDXGIAdapter> adapter;
+        DXGI_ADAPTER_DESC description{};
+        if (SUCCEEDED(shared_d3d11dev_->QueryInterface(IID_PPV_ARGS(&dxgi_device))) &&
+            SUCCEEDED(dxgi_device->GetAdapter(&adapter)) &&
+            SUCCEEDED(adapter->GetDesc(&description)))
+            preferred_vendor_id_ = description.VendorId;
+    }
     InitCLEnv();
 }
 
@@ -648,4 +678,8 @@ bool opencl_yuy2_to_bgra_frame(
         return impl((void*)nullptr);
     else
         return impl(cl::Buffer{});
+}
+
+const char* opencl_device_name() {
+    return device_name_.empty() ? "unknown" : device_name_.c_str();
 }

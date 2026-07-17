@@ -1,6 +1,7 @@
 #include "backend_api.h"
 
 #include <d3d11.h>
+#include <dxgi.h>
 #if defined(BENCHMARK_D3D11ON12)
 #include <d3d11on12.h>
 #include <d3d12.h>
@@ -82,6 +83,45 @@ struct BenchmarkDevice {
 
 BenchmarkDevice create_device() {
     BenchmarkDevice result;
+    ComPtr<IDXGIAdapter> selected_adapter;
+    char* vendor_value = nullptr;
+    size_t vendor_length = 0;
+    if (_dupenv_s(&vendor_value, &vendor_length,
+                  "DX_CL_ADAPTER_VENDOR") == 0 && vendor_value) {
+        (void)vendor_length;
+        char* end = nullptr;
+        const unsigned long vendor = std::strtoul(vendor_value, &end, 0);
+        if (end != vendor_value && *end == '\0') {
+            ComPtr<IDXGIFactory1> factory;
+            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+                for (UINT index = 0; !selected_adapter; ++index) {
+                    ComPtr<IDXGIAdapter1> candidate;
+                    if (factory->EnumAdapters1(index, &candidate) == DXGI_ERROR_NOT_FOUND)
+                        break;
+                    DXGI_ADAPTER_DESC1 description{};
+                    if (SUCCEEDED(candidate->GetDesc1(&description)) &&
+                        description.VendorId == vendor)
+                        selected_adapter = candidate;
+                }
+            }
+        }
+        std::free(vendor_value);
+    }
+    char* index_value = nullptr;
+    size_t index_length = 0;
+    if (!selected_adapter && _dupenv_s(&index_value, &index_length,
+                                       "DX_CL_ADAPTER_INDEX") == 0 && index_value) {
+        (void)index_length;
+        char* end = nullptr;
+        const unsigned long index = std::strtoul(index_value, &end, 10);
+        if (end != index_value && *end == '\0') {
+            ComPtr<IDXGIFactory1> factory;
+            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+                factory->EnumAdapters(index, &selected_adapter);
+        }
+        std::free(index_value);
+    }
+    IDXGIAdapter* adapter = selected_adapter.Get();
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     D3D_FEATURE_LEVEL feature_level{};
@@ -92,7 +132,7 @@ BenchmarkDevice create_device() {
 
 #if defined(BENCHMARK_D3D11ON12)
     HRESULT hr = D3D12CreateDevice(
-        nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&result.d3d12));
+        adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&result.d3d12));
     if (FAILED(hr)) {
         throw std::runtime_error("D3D12 hardware device creation failed (HRESULT " +
                                  std::to_string(static_cast<unsigned long>(hr)) + ")");
@@ -120,12 +160,14 @@ BenchmarkDevice create_device() {
     }
 #else
     HRESULT hr = D3D11CreateDevice(
-        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels,
+        adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+        nullptr, 0, levels,
         static_cast<UINT>(std::size(levels)), D3D11_SDK_VERSION,
         &device, &feature_level, &context);
     if (hr == E_INVALIDARG) {
         hr = D3D11CreateDevice(
-            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, levels + 1, 1,
+            adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+            nullptr, 0, levels + 1, 1,
             D3D11_SDK_VERSION, &device, &feature_level, &context);
     }
 #endif
@@ -135,6 +177,52 @@ BenchmarkDevice create_device() {
     }
     result.d3d11 = std::move(device);
     return result;
+}
+
+std::string adapter_name(const BenchmarkDevice& device) {
+    ComPtr<IDXGIDevice> dxgi_device;
+    ComPtr<IDXGIAdapter> adapter;
+    DXGI_ADAPTER_DESC description{};
+    if (!device.d3d11 || FAILED(device.d3d11.As(&dxgi_device)) ||
+        FAILED(dxgi_device->GetAdapter(&adapter)) ||
+        FAILED(adapter->GetDesc(&description)))
+        return "unknown";
+    const int length = WideCharToMultiByte(CP_UTF8, 0, description.Description,
+                                           -1, nullptr, 0, nullptr, nullptr);
+    if (length <= 1)
+        return "unknown";
+    std::string name(static_cast<size_t>(length), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, description.Description, -1,
+                        name.data(), length, nullptr, nullptr);
+    name.resize(static_cast<size_t>(length - 1));
+    return name;
+}
+
+void print_adapters() {
+    ComPtr<IDXGIFactory1> factory;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+        return;
+    for (UINT index = 0;; ++index) {
+        ComPtr<IDXGIAdapter1> adapter;
+        if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND)
+            break;
+        DXGI_ADAPTER_DESC1 description{};
+        if (FAILED(adapter->GetDesc1(&description)))
+            continue;
+        const int length = WideCharToMultiByte(CP_UTF8, 0, description.Description,
+                                               -1, nullptr, 0, nullptr, nullptr);
+        std::string name(length > 1 ? static_cast<size_t>(length) : 1, '\0');
+        if (length > 1) {
+            WideCharToMultiByte(CP_UTF8, 0, description.Description, -1,
+                                name.data(), length, nullptr, nullptr);
+            name.resize(static_cast<size_t>(length - 1));
+        } else {
+            name = "unknown";
+        }
+        std::cout << "Adapter[" << index << "]: " << name
+                  << " (Vendor 0x" << std::hex << description.VendorId
+                  << ", Flags 0x" << description.Flags << std::dec << ")\n";
+    }
 }
 
 asco::ColorInfo make_color_info() {
@@ -188,6 +276,7 @@ int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
         const auto device = create_device();
+        print_adapters();
 
 #if defined(BENCHMARK_D3D11) || defined(BENCHMARK_D3D11ON12)
         init_d3d11_colorconv(device.d3d11.Get());
@@ -243,6 +332,10 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "Backend:    " << BENCHMARK_BACKEND_NAME << '\n';
+        std::cout << "Adapter:    " << adapter_name(device) << '\n';
+#if defined(BENCHMARK_OPENCL)
+        std::cout << "OpenCL device: " << opencl_device_name() << '\n';
+#endif
 #if defined(BENCHMARK_D3D12)
         std::cout << "Transfer:   " << d3d12_colorconv_transfer_mode() << '\n';
 #endif

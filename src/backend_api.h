@@ -34,6 +34,7 @@ bool d3d12_nv12_to_bgra_frame(
 #elif defined(BENCHMARK_OPENCL)
 void init_opencl(void* d3d11_device);
 bool is_opencl_avail();
+const char* opencl_device_name();
 bool opencl_nv12_to_bgra_frame(
     const asco::ColorInfo& color_info,
     std::size_t width,

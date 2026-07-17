@@ -30,11 +30,10 @@ ComPtr<ID3D12GraphicsCommandList> g_commands;
 ComPtr<ID3D12Fence> g_fence;
 ComPtr<ID3D12RootSignature> g_root_signature;
 ComPtr<ID3D12PipelineState> g_nv12_to_bgra;
-ComPtr<ID3D12DescriptorHeap> g_descriptors;
-UINT g_descriptor_size = 0;
 UINT64 g_fence_value = 0;
 D3D12_HEAP_TYPE g_cpu_to_gpu_heap_type = D3D12_HEAP_TYPE_UPLOAD;
 bool g_direct_mapped_output = false;
+bool g_staged_input = false;
 std::mutex g_run_mutex;
 std::atomic_bool g_enabled{true};
 std::atomic_bool g_operational{false};
@@ -89,7 +88,7 @@ cbuffer P : register(b0) {
 
 ByteAddressBuffer A : register(t0);
 ByteAddressBuffer B : register(t1);
-RWBuffer<uint> O : register(u0);
+RWByteAddressBuffer O : register(u0);
 
 uint2 load_two_bytes(ByteAddressBuffer buffer, uint byte_offset) {
     uint lane = byte_offset & 3;
@@ -131,10 +130,10 @@ void nv12_to_bgra_frame(uint3 id : SV_DispatchThreadID) {
     uint2 top = load_two_bytes(A, y0);
     uint2 bottom = load_two_bytes(A, y1);
 
-    O[o0] = pack_bgra_pixel(top.x, uv.x, uv.y);
-    O[o0 + 1] = pack_bgra_pixel(top.y, uv.x, uv.y);
-    O[o1] = pack_bgra_pixel(bottom.x, uv.x, uv.y);
-    O[o1 + 1] = pack_bgra_pixel(bottom.y, uv.x, uv.y);
+    O.Store(o0 * 4, pack_bgra_pixel(top.x, uv.x, uv.y));
+    O.Store((o0 + 1) * 4, pack_bgra_pixel(top.y, uv.x, uv.y));
+    O.Store(o1 * 4, pack_bgra_pixel(bottom.x, uv.x, uv.y));
+    O.Store((o1 + 1) * 4, pack_bgra_pixel(bottom.y, uv.x, uv.y));
 }
 )";
 
@@ -202,9 +201,59 @@ bool create_cpu_to_gpu_buffer(UINT64 bytes, ComPtr<ID3D12Resource>& result) {
 struct GPUInputBuffer {
     size_t bytes = 0;
     ComPtr<ID3D12Resource> buffer;
+    ComPtr<ID3D12Resource> upload;
+    void* mapped = nullptr;
 
     explicit GPUInputBuffer(size_t buffer_bytes) : bytes(buffer_bytes) {
-        create_cpu_to_gpu_buffer(buffer_bytes, buffer);
+        if (g_staged_input) {
+            if (!create_cpu_to_gpu_buffer(buffer_bytes, upload))
+                return;
+            const auto default_heap = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+            const auto description = buffer_description(buffer_bytes);
+            if (FAILED(g_dev->CreateCommittedResource(
+                    &default_heap, D3D12_HEAP_FLAG_NONE, &description,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(&buffer))))
+                return;
+        } else if (!create_cpu_to_gpu_buffer(buffer_bytes, buffer)) {
+            return;
+        }
+        ID3D12Resource* cpu_resource = g_staged_input ? upload.Get() : buffer.Get();
+        const D3D12_RANGE read_range{0, 0};
+        if (FAILED(cpu_resource->Map(0, &read_range, &mapped)) || !mapped) {
+            buffer.Reset();
+            upload.Reset();
+        }
+    }
+
+    GPUInputBuffer(GPUInputBuffer&& other) noexcept
+        : bytes(other.bytes), buffer(std::move(other.buffer)),
+          upload(std::move(other.upload)), mapped(other.mapped) {
+        other.bytes = 0;
+        other.mapped = nullptr;
+    }
+    GPUInputBuffer& operator=(GPUInputBuffer&& other) noexcept {
+        if (this != &other) {
+            if (mapped) {
+                ID3D12Resource* resource = upload ? upload.Get() : buffer.Get();
+                if (resource) resource->Unmap(0, nullptr);
+            }
+            bytes = other.bytes;
+            buffer = std::move(other.buffer);
+            upload = std::move(other.upload);
+            mapped = other.mapped;
+            other.bytes = 0;
+            other.mapped = nullptr;
+        }
+        return *this;
+    }
+    GPUInputBuffer(const GPUInputBuffer&) = delete;
+    GPUInputBuffer& operator=(const GPUInputBuffer&) = delete;
+    ~GPUInputBuffer() {
+        if (mapped) {
+            ID3D12Resource* resource = upload ? upload.Get() : buffer.Get();
+            if (resource) resource->Unmap(0, nullptr);
+        }
     }
 
     bool Load(const void* data, size_t size, size_t offset_in_buffer) {
@@ -212,29 +261,13 @@ struct GPUInputBuffer {
             size > bytes - offset_in_buffer)
             return false;
 
-        void* mapped = nullptr;
-        const D3D12_RANGE read_range{0, 0};
-        if (FAILED(buffer->Map(0, &read_range, &mapped)))
+        if (!mapped)
             return false;
         std::memcpy(static_cast<unsigned char*>(mapped) + offset_in_buffer,
                     data, size);
-        const D3D12_RANGE written_range{offset_in_buffer,
-                                        offset_in_buffer + size};
-        buffer->Unmap(0, &written_range);
         return true;
     }
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC view() const {
-        D3D12_SHADER_RESOURCE_VIEW_DESC description{};
-        description.Format = DXGI_FORMAT_R32_TYPELESS;
-        description.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-        description.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        description.Buffer.FirstElement = 0;
-        description.Buffer.NumElements = static_cast<UINT>(bytes / sizeof(UINT));
-        description.Buffer.StructureByteStride = 0;
-        description.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-        return description;
-    }
 };
 
 struct GPUOutputBuffer {
@@ -242,6 +275,7 @@ struct GPUOutputBuffer {
     ComPtr<ID3D12Resource> buffer;
     ComPtr<ID3D12Resource> readback;
     bool direct_mapped = false;
+    void* mapped = nullptr;
 
     explicit GPUOutputBuffer(size_t buffer_bytes) : bytes(buffer_bytes) {
         const auto output_description = buffer_description(
@@ -253,28 +287,75 @@ struct GPUOutputBuffer {
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                     IID_PPV_ARGS(&buffer)))) {
                 direct_mapped = true;
+            } else {
+                g_direct_output_allocation_fallback.store(
+                    true, std::memory_order_relaxed);
+                buffer.Reset();
+            }
+        }
+
+        if (!direct_mapped) {
+            const auto default_heap = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
+            if (FAILED(g_dev->CreateCommittedResource(
+                    &default_heap, D3D12_HEAP_FLAG_NONE, &output_description,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                    IID_PPV_ARGS(&buffer)))) {
                 return;
             }
-            g_direct_output_allocation_fallback.store(
-                true, std::memory_order_relaxed);
-            buffer.Reset();
+
+            const auto readback_heap = heap_properties(D3D12_HEAP_TYPE_READBACK);
+            const auto readback_description = buffer_description(buffer_bytes);
+            if (FAILED(g_dev->CreateCommittedResource(
+                    &readback_heap, D3D12_HEAP_FLAG_NONE, &readback_description,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    IID_PPV_ARGS(&readback)))) {
+                buffer.Reset();
+                return;
+            }
         }
 
-        const auto default_heap = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
-        if (FAILED(g_dev->CreateCommittedResource(
-                &default_heap, D3D12_HEAP_FLAG_NONE, &output_description,
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
-                IID_PPV_ARGS(&buffer)))) {
-            return;
+        if (buffer) {
+            ID3D12Resource* cpu_resource = direct_mapped ? buffer.Get() : readback.Get();
+            const D3D12_RANGE read_range{0, 0};
+            if (!cpu_resource || FAILED(cpu_resource->Map(0, &read_range, &mapped)) || !mapped) {
+                mapped = nullptr;
+                buffer.Reset();
+                readback.Reset();
+            }
         }
+    }
 
-        const auto readback_heap = heap_properties(D3D12_HEAP_TYPE_READBACK);
-        const auto readback_description = buffer_description(buffer_bytes);
-        if (FAILED(g_dev->CreateCommittedResource(
-                &readback_heap, D3D12_HEAP_FLAG_NONE, &readback_description,
-                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                IID_PPV_ARGS(&readback)))) {
-            buffer.Reset();
+    GPUOutputBuffer(GPUOutputBuffer&& other) noexcept
+        : bytes(other.bytes), buffer(std::move(other.buffer)),
+          readback(std::move(other.readback)), direct_mapped(other.direct_mapped),
+          mapped(other.mapped) {
+        other.bytes = 0;
+        other.direct_mapped = false;
+        other.mapped = nullptr;
+    }
+    GPUOutputBuffer& operator=(GPUOutputBuffer&& other) noexcept {
+        if (this != &other) {
+            if (mapped) {
+                ID3D12Resource* resource = direct_mapped ? buffer.Get() : readback.Get();
+                if (resource) resource->Unmap(0, nullptr);
+            }
+            bytes = other.bytes;
+            buffer = std::move(other.buffer);
+            readback = std::move(other.readback);
+            direct_mapped = other.direct_mapped;
+            mapped = other.mapped;
+            other.bytes = 0;
+            other.direct_mapped = false;
+            other.mapped = nullptr;
+        }
+        return *this;
+    }
+    GPUOutputBuffer(const GPUOutputBuffer&) = delete;
+    GPUOutputBuffer& operator=(const GPUOutputBuffer&) = delete;
+    ~GPUOutputBuffer() {
+        if (mapped) {
+            ID3D12Resource* resource = direct_mapped ? buffer.Get() : readback.Get();
+            if (resource) resource->Unmap(0, nullptr);
         }
     }
 
@@ -286,42 +367,6 @@ struct GPUOutputBuffer {
         return direct_mapped ? buffer.Get() : readback.Get();
     }
 
-    D3D12_UNORDERED_ACCESS_VIEW_DESC view() const {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC description{};
-        description.Format = DXGI_FORMAT_R32_UINT;
-        description.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-        description.Buffer.FirstElement = 0;
-        description.Buffer.NumElements = static_cast<UINT>(bytes / sizeof(UINT));
-        description.Buffer.StructureByteStride = 0;
-        description.Buffer.CounterOffsetInBytes = 0;
-        description.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
-        return description;
-    }
-};
-
-struct GPUParamsBuffer {
-    size_t bytes = 0;
-    ComPtr<ID3D12Resource> buffer;
-
-    explicit GPUParamsBuffer(size_t buffer_bytes) : bytes(buffer_bytes) {
-        const UINT64 allocation_size =
-            (static_cast<UINT64>(buffer_bytes) + D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1) &
-            ~(static_cast<UINT64>(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT) - 1);
-        create_cpu_to_gpu_buffer(allocation_size, buffer);
-    }
-
-    bool Load(const void* data, size_t size, size_t offset_in_buffer) {
-        if (!buffer || !data || offset_in_buffer != 0 || size != bytes)
-            return false;
-        void* mapped = nullptr;
-        const D3D12_RANGE read_range{0, 0};
-        if (FAILED(buffer->Map(0, &read_range, &mapped)))
-            return false;
-        std::memcpy(mapped, data, size);
-        const D3D12_RANGE written_range{0, size};
-        buffer->Unmap(0, &written_range);
-        return true;
-    }
 };
 
 template<class T>
@@ -392,7 +437,6 @@ private:
 
 BufPool<GPUInputBuffer> g_input_pool(16 * 1024 * 1024);
 BufPool<GPUOutputBuffer> g_output_pool(8 * 1024 * 1024);
-BufPool<GPUParamsBuffer> g_params_pool(1 * 1024 * 1024);
 
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource,
                                   D3D12_RESOURCE_STATES before,
@@ -416,9 +460,9 @@ D3D12_RESOURCE_BARRIER uav_barrier(ID3D12Resource* resource) {
 }
 
 bool execute(const GPUInputBuffer& y, const GPUInputBuffer& uv,
-             GPUOutputBuffer& output, const GPUParamsBuffer& params,
+             GPUOutputBuffer& output, const Params& params,
              UINT work_width, UINT work_height) {
-    if (!y.buffer || !uv.buffer || !output.valid() || !params.buffer)
+    if (!y.buffer || !uv.buffer || !output.valid())
         return false;
 
     const UINT groups_x = (work_width + 31) / 32;
@@ -428,36 +472,46 @@ bool execute(const GPUInputBuffer& y, const GPUInputBuffer& uv,
         groups_y > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION)
         return false;
 
-    D3D12_CPU_DESCRIPTOR_HANDLE cpu =
-        g_descriptors->GetCPUDescriptorHandleForHeapStart();
-    auto y_view = y.view();
-    g_dev->CreateShaderResourceView(y.buffer.Get(), &y_view, cpu);
-    cpu.ptr += g_descriptor_size;
-    auto uv_view = uv.view();
-    g_dev->CreateShaderResourceView(uv.buffer.Get(), &uv_view, cpu);
-    cpu.ptr += g_descriptor_size;
-    auto output_view = output.view();
-    g_dev->CreateUnorderedAccessView(output.buffer.Get(), nullptr,
-                                     &output_view, cpu);
-
     if (FAILED(g_allocator->Reset()) ||
         FAILED(g_commands->Reset(g_allocator.Get(), g_nv12_to_bgra.Get()))) {
         g_operational.store(false, std::memory_order_release);
         return false;
     }
 
-    ID3D12DescriptorHeap* descriptor_heaps[] = {g_descriptors.Get()};
-    g_commands->SetDescriptorHeaps(1, descriptor_heaps);
     g_commands->SetComputeRootSignature(g_root_signature.Get());
-    g_commands->SetComputeRootConstantBufferView(
-        0, params.buffer->GetGPUVirtualAddress());
+    g_commands->SetComputeRoot32BitConstants(0, sizeof(params) / sizeof(UINT),
+                                             &params, 0);
+    g_commands->SetComputeRootShaderResourceView(
+        1, y.buffer->GetGPUVirtualAddress());
+    g_commands->SetComputeRootShaderResourceView(
+        2, uv.buffer->GetGPUVirtualAddress());
+    g_commands->SetComputeRootUnorderedAccessView(
+        3, output.buffer->GetGPUVirtualAddress());
 
-    D3D12_GPU_DESCRIPTOR_HANDLE gpu =
-        g_descriptors->GetGPUDescriptorHandleForHeapStart();
-    g_commands->SetComputeRootDescriptorTable(1, gpu);
-    gpu.ptr += static_cast<UINT64>(2) * g_descriptor_size;
-    g_commands->SetComputeRootDescriptorTable(2, gpu);
+    if (g_staged_input) {
+        g_commands->CopyBufferRegion(y.buffer.Get(), 0, y.upload.Get(), 0, y.bytes);
+        g_commands->CopyBufferRegion(uv.buffer.Get(), 0, uv.upload.Get(), 0, uv.bytes);
+        auto y_to_read = transition(y.buffer.Get(),
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        auto uv_to_read = transition(uv.buffer.Get(),
+                                      D3D12_RESOURCE_STATE_COPY_DEST,
+                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        g_commands->ResourceBarrier(1, &y_to_read);
+        g_commands->ResourceBarrier(1, &uv_to_read);
+    }
     g_commands->Dispatch(groups_x, groups_y, 1);
+
+    if (g_staged_input) {
+        auto y_to_copy = transition(y.buffer.Get(),
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    D3D12_RESOURCE_STATE_COPY_DEST);
+        auto uv_to_copy = transition(uv.buffer.Get(),
+                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                     D3D12_RESOURCE_STATE_COPY_DEST);
+        g_commands->ResourceBarrier(1, &y_to_copy);
+        g_commands->ResourceBarrier(1, &uv_to_copy);
+    }
 
     if (output.direct_mapped) {
         auto output_complete = uav_barrier(output.buffer.Get());
@@ -518,14 +572,12 @@ bool copyback_bgra(GPUOutputBuffer& output, void* destination,
     if (!cpu_resource || !destination || destination_stride < width * 4)
         return false;
 
-    void* mapped = nullptr;
-    const D3D12_RANGE read_range{0, output.bytes};
-    if (FAILED(cpu_resource->Map(0, &read_range, &mapped)))
+    if (!output.mapped)
         return false;
 
     const size_t row_bytes = static_cast<size_t>(width) * 4;
     auto* destination_bytes = static_cast<unsigned char*>(destination);
-    const auto* source_bytes = static_cast<const unsigned char*>(mapped);
+    const auto* source_bytes = static_cast<const unsigned char*>(output.mapped);
     if (destination_stride == row_bytes) {
         std::memcpy(destination_bytes, source_bytes, row_bytes * height);
     } else {
@@ -535,8 +587,6 @@ bool copyback_bgra(GPUOutputBuffer& output, void* destination,
                         row_bytes);
         }
     }
-    const D3D12_RANGE written_range{0, 0};
-    cpu_resource->Unmap(0, &written_range);
     return true;
 }
 
@@ -578,34 +628,23 @@ bool product_to_uint(size_t a, size_t b, UINT& result) {
 
 bool create_root_signature(ID3D12Device* device,
                            ComPtr<ID3D12RootSignature>& result) {
-    D3D12_DESCRIPTOR_RANGE ranges[2]{};
-    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 2;
-    ranges[0].BaseShaderRegister = 0;
-    ranges[0].RegisterSpace = 0;
-    ranges[0].OffsetInDescriptorsFromTableStart = 0;
-    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 1;
-    ranges[1].BaseShaderRegister = 0;
-    ranges[1].RegisterSpace = 0;
-    ranges[1].OffsetInDescriptorsFromTableStart = 0;
-
-    D3D12_ROOT_PARAMETER parameters[3]{};
-    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    parameters[0].Descriptor.ShaderRegister = 0;
-    parameters[0].Descriptor.RegisterSpace = 0;
+    D3D12_ROOT_PARAMETER parameters[4]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = sizeof(Params) / sizeof(UINT);
     parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
-    parameters[1].DescriptorTable.pDescriptorRanges = &ranges[0];
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[1].Descriptor.ShaderRegister = 0;
     parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[2].DescriptorTable.NumDescriptorRanges = 1;
-    parameters[2].DescriptorTable.pDescriptorRanges = &ranges[1];
+    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    parameters[2].Descriptor.ShaderRegister = 1;
     parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    parameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameters[3].Descriptor.ShaderRegister = 0;
+    parameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC description{};
-    description.NumParameters = 3;
+    description.NumParameters = 4;
     description.pParameters = parameters;
     description.NumStaticSamplers = 0;
     description.pStaticSamplers = nullptr;
@@ -712,6 +751,11 @@ void init_d3d12_colorconv(void* d3d11_device) {
         supports_gpu_upload_heap(device.Get());
     const bool direct_mapped_output_supported =
         supports_direct_mapped_output(device.Get());
+#if defined(D3D12_FORCE_UPLOAD_COPY)
+    g_staged_input = true;
+#else
+    g_staged_input = false;
+#endif
 
     D3D12_COMMAND_QUEUE_DESC queue_description{};
     queue_description.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
@@ -747,16 +791,6 @@ void init_d3d12_colorconv(void* d3d11_device) {
                                    IID_PPV_ARGS(&fence))))
         return;
 
-    D3D12_DESCRIPTOR_HEAP_DESC descriptor_description{};
-    descriptor_description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    descriptor_description.NumDescriptors = 3;
-    descriptor_description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    descriptor_description.NodeMask = 0;
-    ComPtr<ID3D12DescriptorHeap> descriptors;
-    if (FAILED(device->CreateDescriptorHeap(&descriptor_description,
-                                            IID_PPV_ARGS(&descriptors))))
-        return;
-
     HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event_handle)
         return;
@@ -768,9 +802,6 @@ void init_d3d12_colorconv(void* d3d11_device) {
     g_fence = std::move(fence);
     g_root_signature = std::move(root_signature);
     g_nv12_to_bgra = std::move(pipeline);
-    g_descriptors = std::move(descriptors);
-    g_descriptor_size = g_dev->GetDescriptorHandleIncrementSize(
-        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     g_fence_value = 0;
 #if defined(HAVE_D3D12_GPU_UPLOAD_HEAP)
     g_cpu_to_gpu_heap_type = gpu_upload_heap_supported
@@ -780,6 +811,8 @@ void init_d3d12_colorconv(void* d3d11_device) {
     (void)gpu_upload_heap_supported;
     g_cpu_to_gpu_heap_type = D3D12_HEAP_TYPE_UPLOAD;
 #endif
+    if (g_staged_input)
+        g_cpu_to_gpu_heap_type = D3D12_HEAP_TYPE_UPLOAD;
     g_direct_mapped_output = direct_mapped_output_supported;
     g_gpu_upload_allocation_fallback.store(false, std::memory_order_relaxed);
     g_direct_output_allocation_fallback.store(false,
@@ -792,8 +825,7 @@ bool is_d3d12_colorconv_avail() {
     return g_enabled.load(std::memory_order_relaxed) &&
            g_operational.load(std::memory_order_acquire) &&
            g_dev && g_queue && g_allocator && g_commands &&
-           g_fence && g_root_signature && g_nv12_to_bgra && g_descriptors &&
-           g_descriptor_size != 0 && g_fence_event.value;
+           g_fence && g_root_signature && g_nv12_to_bgra && g_fence_event.value;
 }
 
 void d3d12_colorconv_set_enabled(bool enabled) {
@@ -811,6 +843,10 @@ const char* d3d12_colorconv_transfer_mode() {
     gpu_upload_selected =
         g_cpu_to_gpu_heap_type == D3D12_HEAP_TYPE_GPU_UPLOAD;
 #endif
+    if (g_staged_input && g_direct_mapped_output)
+        return "UPLOAD input -> DEFAULT; mapped shared-UAV output";
+    if (g_staged_input)
+        return "UPLOAD input -> DEFAULT; DEFAULT-to-READBACK output";
     if (gpu_upload_selected && g_direct_mapped_output) {
         return allocation_fallback
                    ? "GPU_UPLOAD input; mapped shared-UAV output (allocation fallback used)"
@@ -872,11 +908,7 @@ bool d3d12_nv12_to_bgra_frame(
     params.ys = source_y_stride;
     params.us = source_uv_stride;
     params.os = width;
-    auto params_buffer = g_params_pool.Load(&params, sizeof(params));
-    if (!params_buffer || !params_buffer->buffer)
-        return false;
-
-    return execute(*y_buffer, *uv_buffer, *output, *params_buffer,
+    return execute(*y_buffer, *uv_buffer, *output, params,
                    width / 2, height / 2) &&
            copyback_bgra(*output, destination, destination_stride,
                          width, height);
