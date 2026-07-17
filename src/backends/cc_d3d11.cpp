@@ -53,7 +53,7 @@ cbuffer P : register(b0) {
 ByteAddressBuffer A : register(t0);
 ByteAddressBuffer B : register(t1);
 ByteAddressBuffer C : register(t2);
-RWBuffer<uint> O : register(u0);
+RWByteAddressBuffer O : register(u0);
 RWBuffer<uint> OY : register(u1);
 RWBuffer<uint> OU : register(u2);
 RWBuffer<uint> OV : register(u3);
@@ -74,15 +74,18 @@ uint load_dword(ByteAddressBuffer buffer, uint byte_offset) {
     return (low >> shift) | (high << (32 - shift));
 }
 
-uint2 load_two_bytes(ByteAddressBuffer buffer, uint byte_offset) {
+uint2 load_byte2(ByteAddressBuffer buffer, uint byte_offset) {
     uint lane = byte_offset & 3;
-    uint aligned_offset = byte_offset & ~3;
-    uint packed = buffer.Load(aligned_offset);
+    uint packed = buffer.Load(byte_offset & ~3);
     if (lane < 3) {
         uint pair = (packed >> (lane * 8)) & 0xffff;
         return uint2(pair & 255, pair >> 8);
     }
-    return uint2(packed >> 24, buffer.Load(aligned_offset + 4) & 255);
+    return uint2(packed >> 24, buffer.Load((byte_offset & ~3) + 4) & 255);
+}
+
+void store_dword(RWByteAddressBuffer buffer, uint byte_offset, uint value) {
+    buffer.Store(byte_offset, value);
 }
 
 float3 yuv_to_rgb(uint y, uint u, uint v) {
@@ -120,28 +123,38 @@ void nv12_to_bgra_frame(uint3 id : SV_DispatchThreadID) {
     if (pixel.x >= w || pixel.y >= h) return;
 
     uint uvp = id.y * us + pixel.x;
-    uint2 uv = load_two_bytes(B, uvp);
+    uint2 uv = load_byte2(B, uvp);
     uint y0 = pixel.y * ys + pixel.x;
     uint y1 = y0 + ys;
     uint o0 = pixel.y * os + pixel.x;
     uint o1 = o0 + os;
-    uint2 top = load_two_bytes(A, y0);
-    uint2 bottom = load_two_bytes(A, y1);
+    uint2 top = load_byte2(A, y0);
+    uint2 bottom = load_byte2(A, y1);
 
-    O[o0] = pack_bgra_pixel(top.x, uv.x, uv.y);
-    O[o0 + 1] = pack_bgra_pixel(top.y, uv.x, uv.y);
-    O[o1] = pack_bgra_pixel(bottom.x, uv.x, uv.y);
-    O[o1 + 1] = pack_bgra_pixel(bottom.y, uv.x, uv.y);
+    O.Store(o0 * 4, pack_bgra_pixel(top.x, uv.x, uv.y));
+    O.Store((o0 + 1) * 4, pack_bgra_pixel(top.y, uv.x, uv.y));
+    O.Store(o1 * 4, pack_bgra_pixel(bottom.x, uv.x, uv.y));
+    O.Store((o1 + 1) * 4, pack_bgra_pixel(bottom.y, uv.x, uv.y));
 }
 
 [numthreads(8, 8, 1)]
 void i420_to_bgra_frame(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= w || id.y >= h) return;
-    uint2 q = id.xy / 2;
-    uint y = load_byte(A, id.y * ys + id.x);
-    uint u = load_byte(B, q.y * us + q.x);
-    uint v = load_byte(C, q.y * vs + q.x);
-    O[id.y * os + id.x] = pack_bgra_pixel(y, u, v);
+    uint2 pixel = id.xy * 2;
+    if (pixel.x >= w || pixel.y >= h) return;
+
+    uint u = load_byte(B, id.y * us + id.x);
+    uint v = load_byte(C, id.y * vs + id.x);
+    uint y0 = pixel.y * ys + pixel.x;
+    uint y1 = y0 + ys;
+    uint o0 = pixel.y * os + pixel.x;
+    uint o1 = o0 + os;
+    uint2 top = load_byte2(A, y0);
+    uint2 bottom = load_byte2(A, y1);
+
+    O.Store(o0 * 4, pack_bgra_pixel(top.x, u, v));
+    O.Store((o0 + 1) * 4, pack_bgra_pixel(top.y, u, v));
+    O.Store(o1 * 4, pack_bgra_pixel(bottom.x, u, v));
+    O.Store((o1 + 1) * 4, pack_bgra_pixel(bottom.y, u, v));
 }
 
 [numthreads(8, 8, 1)]
@@ -167,8 +180,8 @@ void write_yuy2_pair(uint2 id, uint x, uint packed) {
         chroma.x * one_minus_k.y);
 
     uint output = id.y * os + x;
-    O[output] = pack_bgra_rgb(saturate(luma.xxx + chroma_rgb));
-    O[output + 1] = pack_bgra_rgb(saturate(luma.yyy + chroma_rgb));
+    O.Store(output * 4, pack_bgra_rgb(saturate(luma.xxx + chroma_rgb)));
+    O.Store((output + 1) * 4, pack_bgra_rgb(saturate(luma.yyy + chroma_rgb)));
 }
 
 [numthreads(8, 8, 1)]
@@ -189,16 +202,26 @@ void yuy2_to_bgra_frame_unaligned(uint3 id : SV_DispatchThreadID) {
 
 [numthreads(8, 8, 1)]
 void bgra_to_i420_frame(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= w || id.y >= h) return;
-    uint p0 = id.y * ys + id.x * 4;
-    uint4 z = uint4(load_byte(A, p0), load_byte(A, p0+1), load_byte(A, p0+2), load_byte(A, p0+3));
-    float3 t = rgb_to_yuv(z.zyx);
-    OY[id.y * os + id.x] = round(t.x);
-    if (!(id.x & 1) && !(id.y & 1)) {
-        uint2 q = id.xy / 2;
-        OU[q.y * us + q.x] = round(t.y);
-        OV[q.y * vs + q.x] = round(t.z);
-    }
+    uint2 pixel = id.xy * 2;
+    if (pixel.x >= w || pixel.y >= h) return;
+
+    uint p0 = pixel.y * ys + pixel.x * 4;
+    uint p1 = p0 + ys;
+    uint2 top = uint2(load_dword(A, p0), load_dword(A, p0 + 4));
+    uint2 bottom = uint2(load_dword(A, p1), load_dword(A, p1 + 4));
+    float3 t0 = rgb_to_yuv(uint3((top.x >> 16) & 255, (top.x >> 8) & 255, top.x & 255));
+    float3 t1 = rgb_to_yuv(uint3((top.y >> 16) & 255, (top.y >> 8) & 255, top.y & 255));
+    float3 b0 = rgb_to_yuv(uint3((bottom.x >> 16) & 255, (bottom.x >> 8) & 255, bottom.x & 255));
+    float3 b1 = rgb_to_yuv(uint3((bottom.y >> 16) & 255, (bottom.y >> 8) & 255, bottom.y & 255));
+
+    uint y0 = pixel.y * os + pixel.x;
+    uint y1 = y0 + os;
+    OY[y0] = round(t0.x);
+    OY[y0 + 1] = round(t1.x);
+    OY[y1] = round(b0.x);
+    OY[y1 + 1] = round(b1.x);
+    OU[id.y * us + id.x] = round(t0.y);
+    OV[id.y * vs + id.x] = round(t0.z);
 }
 )";
 
@@ -221,16 +244,18 @@ struct GPUBuffer {
         d.Usage = D3D11_USAGE_DEFAULT;
 #endif
         d.BindFlags = output ? D3D11_BIND_UNORDERED_ACCESS : D3D11_BIND_SHADER_RESOURCE;
-        d.MiscFlags = output ? 0 : D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        const bool raw = !output || format == DXGI_FORMAT_R32_TYPELESS;
+        d.MiscFlags = raw ? D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS : 0;
         if (FAILED(g_dev->CreateBuffer(&d, nullptr, &buffer)))
             return;
         if (output) {
             D3D11_UNORDERED_ACCESS_VIEW_DESC v{};
             v.Format = format;
             v.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-            v.Buffer.NumElements = format == DXGI_FORMAT_R32_UINT
+            v.Buffer.NumElements = format == DXGI_FORMAT_R32_UINT || raw
                 ? d.ByteWidth / sizeof(UINT)
                 : d.ByteWidth;
+            v.Buffer.Flags = raw ? D3D11_BUFFER_UAV_FLAG_RAW : 0;
             if (FAILED(g_dev->CreateUnorderedAccessView(buffer.Get(), &v, &uav)))
                 buffer.Reset();
         } else {
@@ -320,7 +345,7 @@ struct GPUOutputBuffer: GPUBuffer {
 
 struct PackedGPUOutputBuffer: GPUOutputBuffer {
     explicit PackedGPUOutputBuffer(size_t bytes)
-        : GPUOutputBuffer(bytes, DXGI_FORMAT_R32_UINT) {}
+        : GPUOutputBuffer(bytes, DXGI_FORMAT_R32_TYPELESS) {}
 };
 
 
@@ -647,7 +672,7 @@ bool d3d11_i420_to_bgra_frame(const asco::ColorInfo &ci, size_t w, size_t h, con
     auto params_buffer = g_params_pool.Load(&p, sizeof(p));
     if (!params_buffer || !params_buffer->buffer)
         return false;
-    bool ok = run_shader(g_i420_to_bgra, a.get(), b.get(), c.get(), o.get(), nullptr, nullptr, nullptr, params_buffer.get(), width, height) &&
+    bool ok = run_shader(g_i420_to_bgra, a.get(), b.get(), c.get(), o.get(), nullptr, nullptr, nullptr, params_buffer.get(), width / 2, height / 2) &&
               copyback_bgra(*o, d, output_stride, width, height);
     return ok;
 }
@@ -702,7 +727,7 @@ bool d3d11_bgra_to_i420_frame(const asco::ColorInfo &ci, size_t w, size_t h, con
     auto params_buffer = g_params_pool.Load(&p, sizeof(p));
     if (!params_buffer || !params_buffer->buffer)
         return false;
-    bool ok = run_shader(g_bgra_to_i420, a.get(), nullptr, nullptr, nullptr, oy.get(), ou.get(), ov.get(), params_buffer.get(), (UINT)w, (UINT)h) &&
+    bool ok = run_shader(g_bgra_to_i420, a.get(), nullptr, nullptr, nullptr, oy.get(), ou.get(), ov.get(), params_buffer.get(), (UINT)w / 2, (UINT)h / 2) &&
               copyback(*oy, y, (UINT)(ys * h)) &&
               copyback(*ou, u, (UINT)(us * (h / 2))) &&
               copyback(*ov, v, (UINT)(vs * (h / 2)));
