@@ -1,4 +1,5 @@
 #include "cc_d3d11.h"
+#include "../colorconv_common.h"
 #include <cstring>
 #include <d3d11.h>
 #if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
@@ -21,21 +22,23 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-ComPtr<ID3D11Device> g_dev;
-ComPtr<ID3D11DeviceContext> g_ctx;
+std::mutex g_api_mutex;
 std::mutex g_run_mutex;
-ComPtr<ID3D11ComputeShader> g_nv12_to_bgra, g_i420_to_bgra;
-ComPtr<ID3D11ComputeShader> g_i420_to_image2d, g_yuy2_to_bgra;
-ComPtr<ID3D11ComputeShader> g_yuy2_to_bgra_unaligned;
-ComPtr<ID3D11ComputeShader> g_bgra_to_i420;
 bool g_enabled = true;
+
+struct D3D11Runtime {
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
 #if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
-ComPtr<ID3D11On12Device1> g_on12;
-ComPtr<ID3D12Device> g_d3d12;
-ComPtr<ID3D11Query> g_completion_query;
-bool g_direct_output = false;
+    ComPtr<ID3D11On12Device1> on12;
+    ComPtr<ID3D12Device> d3d12;
+    ComPtr<ID3D11Query> completion_query;
+    bool direct_output = false;
 #endif
 
+    bool create(void* source_device);
+    bool valid() const { return device && context; }
+};
 
 struct Params {
     float k[3];
@@ -238,13 +241,15 @@ void bgra_to_i420_frame(uint3 id : SV_DispatchThreadID) {
 
 
 struct GPUBuffer {
+    D3D11Runtime* runtime = nullptr;
     size_t bytes = 0;
     ComPtr<ID3D11Buffer> buffer;
     ComPtr<ID3D11ShaderResourceView> srv;
     ComPtr<ID3D11UnorderedAccessView> uav;
 
-    GPUBuffer(size_t bytes, bool output = false, DXGI_FORMAT format = DXGI_FORMAT_R8_UINT)
-        : bytes(bytes) 
+    GPUBuffer(D3D11Runtime& runtime_value, size_t bytes, bool output = false,
+              DXGI_FORMAT format = DXGI_FORMAT_R8_UINT)
+        : runtime(&runtime_value), bytes(bytes)
     {
         D3D11_BUFFER_DESC d{};
         d.ByteWidth = (UINT)bytes;
@@ -257,7 +262,7 @@ struct GPUBuffer {
         d.BindFlags = output ? D3D11_BIND_UNORDERED_ACCESS : D3D11_BIND_SHADER_RESOURCE;
         const bool raw = !output || format == DXGI_FORMAT_R32_TYPELESS;
         d.MiscFlags = raw ? D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS : 0;
-        if (FAILED(g_dev->CreateBuffer(&d, nullptr, &buffer)))
+        if (FAILED(runtime->device->CreateBuffer(&d, nullptr, &buffer)))
             return;
         if (output) {
             D3D11_UNORDERED_ACCESS_VIEW_DESC v{};
@@ -267,7 +272,7 @@ struct GPUBuffer {
                 ? d.ByteWidth / sizeof(UINT)
                 : d.ByteWidth;
             v.Buffer.Flags = raw ? D3D11_BUFFER_UAV_FLAG_RAW : 0;
-            if (FAILED(g_dev->CreateUnorderedAccessView(buffer.Get(), &v, &uav)))
+            if (FAILED(runtime->device->CreateUnorderedAccessView(buffer.Get(), &v, &uav)))
                 buffer.Reset();
         } else {
             D3D11_SHADER_RESOURCE_VIEW_DESC v{};
@@ -275,7 +280,7 @@ struct GPUBuffer {
             v.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
             v.BufferEx.NumElements = d.ByteWidth / sizeof(UINT);
             v.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
-            if (FAILED(g_dev->CreateShaderResourceView(buffer.Get(), &v, &srv)))
+            if (FAILED(runtime->device->CreateShaderResourceView(buffer.Get(), &v, &srv)))
                 buffer.Reset();
         }
     }
@@ -287,17 +292,17 @@ struct GPUBuffer {
 
 #if defined(D3D11_DYNAMIC_INPUT_UPLOAD)
         D3D11_MAPPED_SUBRESOURCE mapped{};
-        if (FAILED(g_ctx->Map(buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
+        if (FAILED(runtime->context->Map(buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0,
                               &mapped)))
             return false;
         std::memcpy(static_cast<unsigned char *>(mapped.pData) +
                         offset_in_buffer,
                     data, size);
-        g_ctx->Unmap(buffer.Get(), 0);
+        runtime->context->Unmap(buffer.Get(), 0);
         return true;
 #else
         if (offset_in_buffer == 0 && size == bytes) {
-            g_ctx->UpdateSubresource(buffer.Get(), 0, nullptr, data, 0, 0);
+            runtime->context->UpdateSubresource(buffer.Get(), 0, nullptr, data, 0, 0);
             return true;
         }
 
@@ -306,7 +311,7 @@ struct GPUBuffer {
         box.right = (UINT)(offset_in_buffer + size);
         box.bottom = 1;
         box.back = 1;
-        g_ctx->UpdateSubresource(buffer.Get(), 0, &box, data, 0, 0);
+        runtime->context->UpdateSubresource(buffer.Get(), 0, &box, data, 0, 0);
         return true;
 #endif
     }
@@ -322,19 +327,20 @@ struct GPUOutputBuffer: GPUBuffer {
     bool direct = false;
 #endif
 
-    GPUOutputBuffer(size_t bytes, DXGI_FORMAT format = DXGI_FORMAT_R8_UINT)
-        : GPUBuffer(bytes, true, format) 
+    GPUOutputBuffer(D3D11Runtime& runtime_value, size_t bytes,
+                    DXGI_FORMAT format = DXGI_FORMAT_R8_UINT)
+        : GPUBuffer(runtime_value, bytes, true, format)
     {
 #if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
-        if (g_direct_output && format == DXGI_FORMAT_R8_UINT) {
-            if (d3d12_common::create_write_back_buffer(g_d3d12.Get(), bytes,
+        if (runtime->direct_output && format == DXGI_FORMAT_R8_UINT) {
+            if (d3d12_common::create_write_back_buffer(runtime->d3d12.Get(), bytes,
                                                        direct_resource,
                                                        direct_mapped)) {
                 D3D11_RESOURCE_FLAGS flags{};
                 flags.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
                 flags.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
                 ComPtr<ID3D11Buffer> wrapped;
-                if (SUCCEEDED(g_on12->CreateWrappedResource(
+                if (SUCCEEDED(runtime->on12->CreateWrappedResource(
                         direct_resource.Get(), &flags,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -345,7 +351,7 @@ struct GPUOutputBuffer: GPUBuffer {
                     view.Buffer.NumElements = static_cast<UINT>(bytes / 4);
                     view.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
                     ComPtr<ID3D11UnorderedAccessView> wrapped_uav;
-                    if (SUCCEEDED(g_dev->CreateUnorderedAccessView(
+                    if (SUCCEEDED(runtime->device->CreateUnorderedAccessView(
                             wrapped.Get(), &view, &wrapped_uav))) {
                         buffer = std::move(wrapped);
                         uav = std::move(wrapped_uav);
@@ -364,7 +370,7 @@ struct GPUOutputBuffer: GPUBuffer {
         staging_desc.BindFlags = 0;
         staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         staging_desc.MiscFlags = 0;
-        if (FAILED(g_dev->CreateBuffer(&staging_desc, nullptr, &staging)))
+        if (FAILED(runtime->device->CreateBuffer(&staging_desc, nullptr, &staging)))
             return;
     }
 
@@ -375,10 +381,10 @@ struct GPUOutputBuffer: GPUBuffer {
     void* MapBuffer() {
 #if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
         if (direct) {
-            if (g_completion_query) {
-                g_ctx->End(g_completion_query.Get());
-                g_ctx->Flush();
-                while (g_ctx->GetData(g_completion_query.Get(), nullptr, 0,
+            if (runtime->completion_query) {
+                runtime->context->End(runtime->completion_query.Get());
+                runtime->context->Flush();
+                while (runtime->context->GetData(runtime->completion_query.Get(), nullptr, 0,
                                       D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE)
                     YieldProcessor();
             }
@@ -387,9 +393,9 @@ struct GPUOutputBuffer: GPUBuffer {
 #endif
         if (!buffer || !staging || mapped)
             return nullptr;
-        g_ctx->CopyResource(staging.Get(), buffer.Get());
+        runtime->context->CopyResource(staging.Get(), buffer.Get());
         D3D11_MAPPED_SUBRESOURCE mapped_resource{};
-        if (FAILED(g_ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped_resource)))
+        if (FAILED(runtime->context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped_resource)))
             return nullptr;
         mapped = true;
         return mapped_resource.pData;
@@ -402,40 +408,51 @@ struct GPUOutputBuffer: GPUBuffer {
 #endif
         if (!staging || !mapped)
             return;
-        g_ctx->Unmap(staging.Get(), 0);
+        runtime->context->Unmap(staging.Get(), 0);
         mapped = false;
+    }
+
+    bool valid() const {
+#if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
+        return buffer && uav && (direct || staging);
+#else
+        return buffer && uav && staging;
+#endif
     }
 };
 
 
 struct PackedGPUOutputBuffer: GPUOutputBuffer {
-    explicit PackedGPUOutputBuffer(size_t bytes)
-        : GPUOutputBuffer(bytes, DXGI_FORMAT_R32_TYPELESS) {}
+    PackedGPUOutputBuffer(D3D11Runtime& runtime, size_t bytes)
+        : GPUOutputBuffer(runtime, bytes, DXGI_FORMAT_R32_TYPELESS) {}
 };
 
 
 struct GPUParamsBuffer {
+    D3D11Runtime* runtime = nullptr;
     size_t bytes = 0;
     ComPtr<ID3D11Buffer> buffer;
 
-    explicit GPUParamsBuffer(size_t bytes) : bytes(bytes) {
+    GPUParamsBuffer(D3D11Runtime& runtime_value, size_t bytes)
+        : runtime(&runtime_value), bytes(bytes) {
         D3D11_BUFFER_DESC desc{};
         desc.ByteWidth = (UINT)bytes;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        g_dev->CreateBuffer(&desc, nullptr, &buffer);
+        runtime->device->CreateBuffer(&desc, nullptr, &buffer);
     }
 
     bool Load(const void *data, size_t size, size_t offset_in_buffer) {
         if (!buffer || !data || offset_in_buffer != 0 || size != bytes)
             return false;
-        g_ctx->UpdateSubresource(buffer.Get(), 0, nullptr, data, 0, 0);
+        runtime->context->UpdateSubresource(buffer.Get(), 0, nullptr, data, 0, 0);
         return true;
     }
 };
 
 
-bool shader(const char *entry, ComPtr<ID3D11ComputeShader> &out) {
+bool shader(ID3D11Device* device, const char *entry,
+            ComPtr<ID3D11ComputeShader> &out) {
     ComPtr<ID3DBlob> b, e;
     const bool optimize =
         strcmp(entry, "nv12_to_bgra_frame") == 0 ||
@@ -451,14 +468,15 @@ bool shader(const char *entry, ComPtr<ID3D11ComputeShader> &out) {
             OutputDebugStringA((const char *)e->GetBufferPointer());
         return false;
     }
-    return SUCCEEDED(g_dev->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &out));
+    return SUCCEEDED(device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &out));
 }
 
 
 template<class T>
 class BufPool {
 public:
-    BufPool(size_t threshold) : threshold_(threshold) {}
+    explicit BufPool(D3D11Runtime& runtime, size_t threshold)
+        : runtime_(runtime), threshold_(threshold) {}
 
     std::shared_ptr<T> Load(const void *data, UINT bytes) {
         auto ret = Aquire(bytes);
@@ -479,6 +497,7 @@ public:
     }
 
 private:
+    D3D11Runtime& runtime_;
     std::multimap<size_t, T> pool_;
     std::multimap<size_t, T> oldpool_;
     std::mutex pool_mutex_;
@@ -503,7 +522,7 @@ private:
         }
 
         lock.unlock();
-        return T(bytes);
+        return T(runtime_, bytes);
     }
 
     void Release(T&& buf) {
@@ -511,7 +530,7 @@ private:
         if (!buf.buffer)
             return;
         if constexpr (std::is_base_of_v<GPUOutputBuffer, T>) {
-            if (!buf.staging)
+            if (!buf.valid())
                 return;
         }
         auto bytes = buf.bytes;
@@ -528,13 +547,8 @@ private:
 };
 
 
-BufPool<GPUBuffer> g_input_pool(16 * 1024 * 1024);
-BufPool<GPUOutputBuffer> g_output_pool(8 * 1024 * 1024);
-BufPool<PackedGPUOutputBuffer> g_packed_output_pool(8 * 1024 * 1024);
-BufPool<GPUParamsBuffer> g_params_pool(1 * 1024 * 1024);
-
 bool copyback(GPUOutputBuffer &x, void *dst, UINT bytes) {
-    if (!x.buffer || !x.staging)
+    if (!x.valid())
         return false;
     auto ptr = (const unsigned char*)x.MapBuffer();
     if (!ptr)
@@ -546,7 +560,7 @@ bool copyback(GPUOutputBuffer &x, void *dst, UINT bytes) {
 
 
 bool copyback_bgra(GPUOutputBuffer &x, void *dst, UINT dst_stride, UINT w, UINT h) {
-    if (!x.buffer || !x.staging)
+    if (!x.valid())
         return false;
     auto ptr = static_cast<const unsigned char *>(x.MapBuffer());
     if (!ptr)
@@ -569,14 +583,10 @@ bool copyback_bgra(GPUOutputBuffer &x, void *dst, UINT dst_stride, UINT w, UINT 
 
 void params(const asco::ColorInfo &ci, Params &p, UINT w, UINT h) {
     p = {};
-    p.k[0] = ci.trans_matrix == asco::ColorTransMatrix::BT601 ? .299f : .2126f;
-    p.k[1] = ci.trans_matrix == asco::ColorTransMatrix::BT601 ? .587f : .7152f;
-    p.k[2] = ci.trans_matrix == asco::ColorTransMatrix::BT601 ? .114f : .0722f;
+    const auto common = colorconv::make_color_params(ci);
+    std::memcpy(p.k, common.k, sizeof(p.k));
     p.inv_k_y = 1.f / p.k[1];
-    p.range[0] = ci.nominal_range == asco::ColorNominalRange::_0_255 ? 0 : 16.f / 255;
-    p.range[1] = ci.nominal_range == asco::ColorNominalRange::_0_255 ? 1 : 255.f / 219;
-    p.range[2] = p.range[0];
-    p.range[3] = ci.nominal_range == asco::ColorNominalRange::_0_255 ? 1 : 255.f / 224;
+    std::memcpy(p.range, common.range, sizeof(p.range));
     p.w = w;
     p.h = h;
 }
@@ -588,8 +598,10 @@ bool run_shader(ComPtr<ID3D11ComputeShader> &cs, const GPUBuffer *a, const GPUBu
          const GPUParamsBuffer *params_buffer, UINT w, UINT h, UINT group_width = 8,
          UINT group_height = 8) {
     std::lock_guard<std::mutex> lock(g_run_mutex);
-    if (!cs || !params_buffer || !params_buffer->buffer)
+    if (!cs || !params_buffer || !params_buffer->buffer ||
+        !params_buffer->runtime)
         return false;
+    auto& runtime = *params_buffer->runtime;
     ID3D11UnorderedAccessView *uv[4] = {
         o ? o->uav.Get() : nullptr,
         oy ? oy->uav.Get() : nullptr,
@@ -599,234 +611,296 @@ bool run_shader(ComPtr<ID3D11ComputeShader> &cs, const GPUBuffer *a, const GPUBu
         a ? a->srv.Get() : nullptr,
         b ? b->srv.Get() : nullptr,
         c ? c->srv.Get() : nullptr};
-    g_ctx->CSSetShader(cs.Get(), nullptr, 0);
+    runtime.context->CSSetShader(cs.Get(), nullptr, 0);
     ID3D11Buffer *constant_buffer = params_buffer->buffer.Get();
-    g_ctx->CSSetConstantBuffers(0, 1, &constant_buffer);
-    g_ctx->CSSetShaderResources(0, 3, sv);
-    g_ctx->CSSetUnorderedAccessViews(0, 4, uv, nullptr);
+    runtime.context->CSSetConstantBuffers(0, 1, &constant_buffer);
+    runtime.context->CSSetShaderResources(0, 3, sv);
+    runtime.context->CSSetUnorderedAccessViews(0, 4, uv, nullptr);
 #if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
     ID3D11Resource* wrapped_resource = nullptr;
-    if (g_direct_output && o) {
+    if (runtime.direct_output && o) {
         auto* output = static_cast<const GPUOutputBuffer*>(o);
         if (output->direct) {
             wrapped_resource = output->buffer.Get();
-            g_on12->AcquireWrappedResources(&wrapped_resource, 1);
+            runtime.on12->AcquireWrappedResources(&wrapped_resource, 1);
         }
     }
 #endif
-    g_ctx->Dispatch((w + group_width - 1) / group_width,
-                    (h + group_height - 1) / group_height, 1);
+    runtime.context->Dispatch((w + group_width - 1) / group_width,
+                              (h + group_height - 1) / group_height, 1);
 #if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
     if (wrapped_resource)
-        g_on12->ReleaseWrappedResources(&wrapped_resource, 1);
+        runtime.on12->ReleaseWrappedResources(&wrapped_resource, 1);
 #endif
     ID3D11ShaderResourceView *zs[3] = {};
     ID3D11UnorderedAccessView *zu[4] = {};
-    g_ctx->CSSetShaderResources(0, 3, zs);
-    g_ctx->CSSetUnorderedAccessViews(0, 4, zu, nullptr);
+    runtime.context->CSSetShaderResources(0, 3, zs);
+    runtime.context->CSSetUnorderedAccessViews(0, 4, zu, nullptr);
     return true;
 }
 
 
-} // namespace
+struct D3D11ShaderSet {
+    ComPtr<ID3D11ComputeShader> nv12_to_bgra, i420_to_bgra;
+    ComPtr<ID3D11ComputeShader> i420_to_image2d, yuy2_to_bgra;
+    ComPtr<ID3D11ComputeShader> yuy2_to_bgra_unaligned, bgra_to_i420;
 
+    bool create(ID3D11Device* device) {
+        return shader(device, "nv12_to_bgra_frame", nv12_to_bgra) &&
+               shader(device, "i420_to_bgra_frame", i420_to_bgra) &&
+               shader(device, "i420_to_image2d", i420_to_image2d) &&
+               shader(device, "yuy2_to_bgra_frame", yuy2_to_bgra) &&
+               shader(device, "yuy2_to_bgra_frame_unaligned", yuy2_to_bgra_unaligned) &&
+               shader(device, "bgra_to_i420_frame", bgra_to_i420);
+    }
+};
 
-void init_d3d11_colorconv(void *d) {
-    auto source_device = static_cast<ID3D11Device *>(d);
+bool D3D11Runtime::create(void* source) {
+    auto* source_device = static_cast<ID3D11Device*>(source);
     if (!source_device)
-        return;
-
+        return false;
     ComPtr<IDXGIDevice> dxgi_device;
     ComPtr<IDXGIAdapter> adapter;
     if (FAILED(source_device->QueryInterface(IID_PPV_ARGS(&dxgi_device))) ||
-        FAILED(dxgi_device->GetAdapter(&adapter))) {
-        return;
-    }
+        FAILED(dxgi_device->GetAdapter(&adapter)))
+        return false;
 
-    static const D3D_FEATURE_LEVEL feature_levels[] = {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-        D3D_FEATURE_LEVEL_10_1,
-        D3D_FEATURE_LEVEL_10_0,
-    };
+    static const D3D_FEATURE_LEVEL levels[] = {
+        D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
     D3D_FEATURE_LEVEL feature_level{};
-    ComPtr<ID3D11Device> conversion_device;
-    ComPtr<ID3D11DeviceContext> conversion_context;
 #if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
-    conversion_device = source_device;
-    source_device->GetImmediateContext(&conversion_context);
-    HRESULT hr = conversion_device && conversion_context ? S_OK : E_FAIL;
+    device = source_device;
+    source_device->GetImmediateContext(&context);
+    HRESULT hr = device && context ? S_OK : E_FAIL;
 #else
     HRESULT hr = D3D11CreateDevice(
         adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-        feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
-        &conversion_device, &feature_level, &conversion_context);
-    if (hr == E_INVALIDARG) {
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
+        D3D11_SDK_VERSION, &device, &feature_level, &context);
+    if (hr == E_INVALIDARG)
         hr = D3D11CreateDevice(
             adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-            feature_levels + 1, ARRAYSIZE(feature_levels) - 1,
-            D3D11_SDK_VERSION,
-            &conversion_device, &feature_level, &conversion_context);
-    }
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels + 1,
+            ARRAYSIZE(levels) - 1, D3D11_SDK_VERSION, &device,
+            &feature_level, &context);
 #endif
+    (void)feature_level;
     if (FAILED(hr))
-        return;
-
+        return false;
     ComPtr<ID3D10Multithread> multithread;
-    if (SUCCEEDED(conversion_device.As(&multithread)))
+    if (SUCCEEDED(device.As(&multithread)))
         multithread->SetMultithreadProtected(TRUE);
-
-    g_dev = std::move(conversion_device);
-    g_ctx = std::move(conversion_context);
 #if defined(D3D11ON12_UMA_DIRECT_OUTPUT)
-    if (SUCCEEDED(g_dev.As(&g_on12)) &&
-        SUCCEEDED(g_on12->GetD3D12Device(IID_PPV_ARGS(&g_d3d12))) &&
-        d3d12_common::supports_uma_write_back(g_d3d12.Get())) {
+    if (SUCCEEDED(device.As(&on12)) &&
+        SUCCEEDED(on12->GetD3D12Device(IID_PPV_ARGS(&d3d12))) &&
+        d3d12_common::supports_uma_write_back(d3d12.Get())) {
         D3D11_QUERY_DESC query_desc{D3D11_QUERY_EVENT, 0};
-        g_direct_output = SUCCEEDED(g_dev->CreateQuery(&query_desc, &g_completion_query));
+        direct_output = SUCCEEDED(device->CreateQuery(&query_desc, &completion_query));
     }
 #endif
-    shader("nv12_to_bgra_frame", g_nv12_to_bgra);
-    shader("i420_to_bgra_frame", g_i420_to_bgra);
-    shader("i420_to_image2d", g_i420_to_image2d);
-    shader("yuy2_to_bgra_frame", g_yuy2_to_bgra);
-    shader("yuy2_to_bgra_frame_unaligned", g_yuy2_to_bgra_unaligned);
-    shader("bgra_to_i420_frame", g_bgra_to_i420);
+    return true;
 }
 
+struct D3D11Converter {
+    D3D11Runtime runtime;
+    D3D11ShaderSet shaders;
+    BufPool<GPUBuffer> input_pool;
+    BufPool<GPUOutputBuffer> output_pool;
+    BufPool<PackedGPUOutputBuffer> packed_pool;
+    BufPool<GPUParamsBuffer> params_pool;
+    bool operational = false;
+
+    D3D11Converter()
+        : input_pool(runtime, 16 * 1024 * 1024),
+          output_pool(runtime, 8 * 1024 * 1024),
+          packed_pool(runtime, 8 * 1024 * 1024),
+          params_pool(runtime, 1 * 1024 * 1024) {}
+
+    bool initialize(void* source) {
+        return runtime.create(source) && shaders.create(runtime.device.Get()) &&
+               (operational = true);
+    }
+
+    bool nv12(const asco::ColorInfo&, size_t, size_t, void*, size_t,
+              const void*, size_t, const void*, size_t);
+    bool i420(const asco::ColorInfo&, size_t, size_t, const void*, size_t,
+              const void*, size_t, const void*, size_t, void*, size_t);
+    bool yuy2(const asco::ColorInfo&, size_t, size_t, const void*, size_t,
+              void*, size_t);
+    bool bgra_to_i420(const asco::ColorInfo&, size_t, size_t, const void*,
+                     size_t, void*, size_t, void*, size_t, void*, size_t);
+};
+
+bool D3D11Converter::nv12(const asco::ColorInfo& ci, size_t w, size_t h,
+                          void* dst, size_t ds, const void* y, size_t ys,
+                          const void* uv, size_t us) {
+    colorconv::Nv12Layout layout{};
+    if (!operational || !dst || !y || !uv ||
+        !colorconv::validate_nv12(w, h, ds, ys, us, layout))
+        return false;
+    auto a = input_pool.Load(y, layout.y_bytes);
+    auto b = input_pool.Load(uv, layout.uv_bytes);
+    auto o = packed_pool.Aquire(layout.output_bytes);
+    if (!a || !b || !o || !a->buffer || !b->buffer || !o->buffer)
+        return false;
+    Params p{};
+    params(ci, p, layout.width, layout.height);
+    p.ys = layout.y_stride;
+    p.us = layout.uv_stride;
+    p.os = layout.width;
+    auto constants = params_pool.Load(&p, sizeof(p));
+    return constants && constants->buffer &&
+           run_shader(shaders.nv12_to_bgra, a.get(), b.get(), nullptr, o.get(),
+                      nullptr, nullptr, nullptr, constants.get(),
+                      layout.width / 2, layout.height / 2) &&
+           copyback_bgra(*o, dst, layout.destination_stride, layout.width,
+                         layout.height);
+}
+
+bool D3D11Converter::i420(const asco::ColorInfo& ci, size_t w, size_t h,
+                          const void* y, size_t ys, const void* u, size_t us,
+                          const void* v, size_t vs, void* dst, size_t ds) {
+    UINT width, height, y_stride, u_stride, v_stride, out_stride;
+    UINT y_bytes, u_bytes, v_bytes, output_bytes;
+    if (!operational || !dst || !y || !u || !v || w < 2 || h < 2 ||
+        (w & 1) || (h & 1) || w > (std::numeric_limits<UINT>::max)() / 4 ||
+        ys < w || us < w / 2 || vs < w / 2 || ds < w * 4 ||
+        !colorconv::to_uint(w, width) || !colorconv::to_uint(h, height) ||
+        !colorconv::to_uint(ys, y_stride) || !colorconv::to_uint(us, u_stride) ||
+        !colorconv::to_uint(vs, v_stride) || !colorconv::to_uint(ds, out_stride) ||
+        !colorconv::product_to_uint(ys, h, y_bytes) ||
+        !colorconv::product_to_uint(us, h / 2, u_bytes) ||
+        !colorconv::product_to_uint(vs, h / 2, v_bytes) ||
+        !colorconv::product_to_uint(w * 4, h, output_bytes))
+        return false;
+    auto a = input_pool.Load(y, y_bytes), b = input_pool.Load(u, u_bytes),
+         c = input_pool.Load(v, v_bytes);
+    auto o = packed_pool.Aquire(output_bytes);
+    if (!a || !b || !c || !o || !a->buffer || !b->buffer || !c->buffer ||
+        !o->buffer)
+        return false;
+    Params p{};
+    params(ci, p, width, height);
+    p.ys = y_stride; p.us = u_stride; p.vs = v_stride; p.os = width;
+    auto constants = params_pool.Load(&p, sizeof(p));
+    return constants && constants->buffer &&
+           run_shader(shaders.i420_to_bgra, a.get(), b.get(), c.get(), o.get(),
+                      nullptr, nullptr, nullptr, constants.get(), width / 2,
+                      height / 2) &&
+           copyback_bgra(*o, dst, out_stride, width, height);
+}
+
+bool D3D11Converter::yuy2(const asco::ColorInfo& ci, size_t w, size_t h,
+                          const void* src, size_t ss, void* dst, size_t ds) {
+    UINT width, height, source_stride, output_stride, source_bytes, output_bytes;
+    if (!operational || !src || !dst || w < 2 || h < 1 || (w & 1) ||
+        ss < w * 2 || ds < w * 4 || !colorconv::to_uint(w, width) ||
+        !colorconv::to_uint(h, height) || !colorconv::to_uint(ss, source_stride) ||
+        !colorconv::to_uint(ds, output_stride) ||
+        !colorconv::product_to_uint(ss, h, source_bytes) ||
+        !colorconv::product_to_uint(w * 4, h, output_bytes))
+        return false;
+    auto a = input_pool.Load(src, source_bytes);
+    auto o = packed_pool.Aquire(output_bytes);
+    if (!a || !o || !a->buffer || !o->buffer)
+        return false;
+    Params p{};
+    params(ci, p, width, height); p.ys = source_stride; p.os = width;
+    auto constants = params_pool.Load(&p, sizeof(p));
+    auto& shader_object = (source_stride & 3) ? shaders.yuy2_to_bgra_unaligned
+                                               : shaders.yuy2_to_bgra;
+    return constants && constants->buffer &&
+           run_shader(shader_object, a.get(), nullptr, nullptr, o.get(),
+                      nullptr, nullptr, nullptr, constants.get(), width / 2,
+                      height) &&
+           copyback_bgra(*o, dst, output_stride, width, height);
+}
+
+bool D3D11Converter::bgra_to_i420(const asco::ColorInfo& ci, size_t w,
+                                  size_t h, const void* src, size_t ss,
+                                  void* y, size_t ys, void* u, size_t us,
+                                  void* v, size_t vs) {
+    UINT width, height, source_stride, y_stride, u_stride, v_stride;
+    UINT source_bytes, y_bytes, u_bytes, v_bytes;
+    if (!operational || !src || !y || !u || !v || w < 2 || h < 2 ||
+        (w & 1) || (h & 1) || ss < w * 4 || ys < w || us < w / 2 ||
+        vs < w / 2 || !colorconv::to_uint(w, width) ||
+        !colorconv::to_uint(h, height) || !colorconv::to_uint(ss, source_stride) ||
+        !colorconv::to_uint(ys, y_stride) || !colorconv::to_uint(us, u_stride) ||
+        !colorconv::to_uint(vs, v_stride) ||
+        !colorconv::product_to_uint(ss, h, source_bytes) ||
+        !colorconv::product_to_uint(ys, h, y_bytes) ||
+        !colorconv::product_to_uint(us, h / 2, u_bytes) ||
+        !colorconv::product_to_uint(vs, h / 2, v_bytes))
+        return false;
+    auto a = input_pool.Load(src, source_bytes);
+    auto oy = output_pool.Aquire(y_bytes), ou = output_pool.Aquire(u_bytes),
+         ov = output_pool.Aquire(v_bytes);
+    if (!a || !oy || !ou || !ov || !a->buffer || !oy->buffer || !ou->buffer ||
+        !ov->buffer)
+        return false;
+    Params p{};
+    params(ci, p, width, height); p.ys = source_stride; p.us = u_stride;
+    p.vs = v_stride; p.os = y_stride;
+    auto constants = params_pool.Load(&p, sizeof(p));
+    return constants && constants->buffer &&
+           run_shader(shaders.bgra_to_i420, a.get(), nullptr, nullptr, nullptr,
+                      oy.get(), ou.get(), ov.get(), constants.get(), width / 2,
+                      height / 2) &&
+           copyback(*oy, y, y_bytes) && copyback(*ou, u, u_bytes) &&
+           copyback(*ov, v, v_bytes);
+}
+
+std::unique_ptr<D3D11Converter> g_converter;
+
+} // namespace
+
+void init_d3d11_colorconv(void* device) {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (g_converter || !device)
+        return;
+    auto converter = std::make_unique<D3D11Converter>();
+    if (converter->initialize(device))
+        g_converter = std::move(converter);
+}
 
 bool is_d3d11_colorconv_avail() {
-    return g_enabled && g_dev && g_ctx &&
-           g_nv12_to_bgra && g_i420_to_bgra && g_i420_to_image2d &&
-           g_yuy2_to_bgra && g_yuy2_to_bgra_unaligned && g_bgra_to_i420;
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    return g_enabled && g_converter && g_converter->operational &&
+           g_converter->runtime.valid();
 }
 
-
 void d3d11_colorconv_set_enabled(bool enabled) {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
     g_enabled = enabled;
 }
 
-
-bool d3d11_nv12_to_bgra_frame(const asco::ColorInfo &ci, size_t w, size_t h, void *d, size_t ds,
-                              const void *y, size_t ys, const void *uv, size_t us) {
-    if (!is_d3d11_colorconv_avail() || !d || !y || !uv || w < 2 || h < 2 || (w & 1) || (h & 1))
-        return false;
-    const UINT width = (UINT)w, height = (UINT)h;
-    const UINT y_stride = (UINT)ys, uv_stride = (UINT)us;
-    const UINT output_stride = (UINT)ds;
-    const UINT y_bytes = (UINT)(ys * h);
-    const UINT uv_bytes = (UINT)(us * (h / 2));
-    const UINT output_bytes = (UINT)(w * 4 * h);
-    auto a = g_input_pool.Load(y, y_bytes);
-    auto b = g_input_pool.Load(uv, uv_bytes);
-    auto o = g_packed_output_pool.Aquire(output_bytes);
-    if (!a || !b || !o || !a->buffer || !b->buffer || !o->buffer)
-        return false;
-    Params p;
-    params(ci, p, width, height);
-    p.ys = y_stride;
-    p.us = uv_stride;
-    p.os = width;
-    auto params_buffer = g_params_pool.Load(&p, sizeof(p));
-    if (!params_buffer || !params_buffer->buffer)
-        return false;
-    bool ok = run_shader(g_nv12_to_bgra, a.get(), b.get(), nullptr, o.get(), nullptr, nullptr, nullptr, params_buffer.get(), width / 2, height / 2) &&
-              copyback_bgra(*o, d, output_stride, width, height);
-    return ok;
+bool d3d11_nv12_to_bgra_frame(const asco::ColorInfo& ci, size_t w, size_t h,
+                              void* d, size_t ds, const void* y, size_t ys,
+                              const void* uv, size_t us) {
+    return g_enabled && g_converter &&
+           g_converter->nv12(ci, w, h, d, ds, y, ys, uv, us);
 }
 
-
-bool d3d11_i420_to_bgra_frame(const asco::ColorInfo &ci, size_t w, size_t h, const void *y,
-                              size_t ys, const void *u, size_t us, const void *v, size_t vs,
-                              void *d, size_t ds) {
-    if (!is_d3d11_colorconv_avail() || !d || !y || !u || !v || w < 2 || h < 2 || (w & 1) || (h & 1))
-        return false;
-    const UINT width = (UINT)w, height = (UINT)h;
-    const UINT y_stride = (UINT)ys, u_stride = (UINT)us;
-    const UINT v_stride = (UINT)vs, output_stride = (UINT)ds;
-    const UINT y_bytes = (UINT)(ys * h);
-    const UINT u_bytes = (UINT)(us * (h / 2));
-    const UINT v_bytes = (UINT)(vs * (h / 2));
-    const UINT output_bytes = (UINT)(w * 4 * h);
-    auto a = g_input_pool.Load(y, y_bytes);
-    auto b = g_input_pool.Load(u, u_bytes);
-    auto c = g_input_pool.Load(v, v_bytes);
-    auto o = g_packed_output_pool.Aquire(output_bytes);
-    if (!a || !b || !c || !o || !a->buffer || !b->buffer || !c->buffer || !o->buffer)
-        return false;
-    Params p;
-    params(ci, p, width, height);
-    p.ys = y_stride;
-    p.us = u_stride;
-    p.vs = v_stride;
-    p.os = width;
-    auto params_buffer = g_params_pool.Load(&p, sizeof(p));
-    if (!params_buffer || !params_buffer->buffer)
-        return false;
-    bool ok = run_shader(g_i420_to_bgra, a.get(), b.get(), c.get(), o.get(), nullptr, nullptr, nullptr, params_buffer.get(), width / 2, height / 2) &&
-              copyback_bgra(*o, d, output_stride, width, height);
-    return ok;
+bool d3d11_i420_to_bgra_frame(const asco::ColorInfo& ci, size_t w, size_t h,
+                              const void* y, size_t ys, const void* u, size_t us,
+                              const void* v, size_t vs, void* d, size_t ds) {
+    return g_enabled && g_converter &&
+           g_converter->i420(ci, w, h, y, ys, u, us, v, vs, d, ds);
 }
 
-
-bool d3d11_yuy2_to_bgra_frame(const asco::ColorInfo &ci, size_t w, size_t h, const void *s,
-                              size_t ss, void *d, size_t ds) {
-    if (!is_d3d11_colorconv_avail() || !s || !d || w < 2 || h < 1 || (w & 1))
-        return false;
-    const UINT width = (UINT)w, height = (UINT)h;
-    const UINT source_stride = (UINT)ss, output_stride = (UINT)ds;
-    const UINT source_bytes = (UINT)(ss * h);
-    const UINT output_bytes = (UINT)(w * 4 * h);
-    auto a = g_input_pool.Load(s, source_bytes);
-    auto o = g_packed_output_pool.Aquire(output_bytes);
-    if (!a || !o || !a->buffer || !o->buffer)
-        return false;
-    Params p;
-    params(ci, p, width, height);
-    p.ys = source_stride;
-    p.os = width;
-    auto params_buffer = g_params_pool.Load(&p, sizeof(p));
-    if (!params_buffer || !params_buffer->buffer)
-        return false;
-    auto &yuy2_shader = (source_stride & 3)
-        ? g_yuy2_to_bgra_unaligned
-        : g_yuy2_to_bgra;
-    bool ok = run_shader(yuy2_shader, a.get(), nullptr, nullptr, o.get(), nullptr, nullptr, nullptr, params_buffer.get(), width / 2, height) &&
-              copyback_bgra(*o, d, output_stride, width, height);
-    return ok;
+bool d3d11_yuy2_to_bgra_frame(const asco::ColorInfo& ci, size_t w, size_t h,
+                              const void* s, size_t ss, void* d, size_t ds) {
+    return g_enabled && g_converter && g_converter->yuy2(ci, w, h, s, ss, d, ds);
 }
 
-
-bool d3d11_bgra_to_i420_frame(const asco::ColorInfo &ci, size_t w, size_t h, const void *s,
-                              size_t ss, void *y, size_t ys, void *u, size_t us, void *v,
-                              size_t vs) {
-    if (!is_d3d11_colorconv_avail() || !s || !y || !u || !v || w < 2 || h < 2 || (w & 1) || (h & 1))
-        return false;
-    auto a = g_input_pool.Load(s, (UINT)(ss * h));
-    auto oy = g_output_pool.Aquire((UINT)(ys * h));
-    auto ou = g_output_pool.Aquire((UINT)(us * (h / 2)));
-    auto ov = g_output_pool.Aquire((UINT)(vs * (h / 2)));
-    if (!a || !oy || !ou || !ov ||
-        !a->buffer || !oy->buffer || !ou->buffer || !ov->buffer)
-        return false;
-    Params p;
-    params(ci, p, (UINT)w, (UINT)h);
-    p.ys = (UINT)ss;
-    p.us = (UINT)us;
-    p.vs = (UINT)vs;
-    p.os = (UINT)ys;
-    auto params_buffer = g_params_pool.Load(&p, sizeof(p));
-    if (!params_buffer || !params_buffer->buffer)
-        return false;
-    bool ok = run_shader(g_bgra_to_i420, a.get(), nullptr, nullptr, nullptr, oy.get(), ou.get(), ov.get(), params_buffer.get(), (UINT)w / 2, (UINT)h / 2) &&
-              copyback(*oy, y, (UINT)(ys * h)) &&
-              copyback(*ou, u, (UINT)(us * (h / 2))) &&
-              copyback(*ov, v, (UINT)(vs * (h / 2)));
-    return ok;
+bool d3d11_bgra_to_i420_frame(const asco::ColorInfo& ci, size_t w, size_t h,
+                              const void* s, size_t ss, void* y, size_t ys,
+                              void* u, size_t us, void* v, size_t vs) {
+    return g_enabled && g_converter &&
+           g_converter->bgra_to_i420(ci, w, h, s, ss, y, ys, u, us, v, vs);
 }
-
 
 struct D3D11InputBuf::Internal {
     const void *ptr;

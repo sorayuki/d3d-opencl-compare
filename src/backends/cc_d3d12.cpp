@@ -1,4 +1,5 @@
 #include "cc_d3d12.h"
+#include "../colorconv_common.h"
 
 #include <d3d11.h>
 #include <d3d12.h>
@@ -24,22 +25,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-ComPtr<ID3D12Device> g_dev;
-ComPtr<ID3D12CommandQueue> g_queue;
-ComPtr<ID3D12CommandAllocator> g_allocator;
-ComPtr<ID3D12GraphicsCommandList> g_commands;
-ComPtr<ID3D12Fence> g_fence;
-ComPtr<ID3D12RootSignature> g_root_signature;
-ComPtr<ID3D12PipelineState> g_nv12_to_bgra;
-UINT64 g_fence_value = 0;
-D3D12_HEAP_TYPE g_cpu_to_gpu_heap_type = D3D12_HEAP_TYPE_UPLOAD;
-bool g_direct_mapped_output = false;
-bool g_staged_input = false;
-std::mutex g_run_mutex;
+std::mutex g_api_mutex;
 std::atomic_bool g_enabled{true};
-std::atomic_bool g_operational{false};
-std::atomic_bool g_gpu_upload_allocation_fallback{false};
-std::atomic_bool g_direct_output_allocation_fallback{false};
 
 struct EventHandle {
     HANDLE value = nullptr;
@@ -60,7 +47,32 @@ struct EventHandle {
     }
 };
 
-EventHandle g_fence_event;
+struct D3D12TransferPolicy {
+    D3D12_HEAP_TYPE input_heap = D3D12_HEAP_TYPE_UPLOAD;
+    bool staged_input = false;
+    bool direct_output = false;
+    bool gpu_upload_fallback = false;
+    bool direct_output_fallback = false;
+
+    void detect(ID3D12Device* device);
+    const char* description() const;
+};
+
+struct D3D12Runtime {
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12CommandQueue> queue;
+    ComPtr<ID3D12CommandAllocator> allocator;
+    ComPtr<ID3D12GraphicsCommandList> commands;
+    ComPtr<ID3D12Fence> fence;
+    ComPtr<ID3D12RootSignature> root_signature;
+    ComPtr<ID3D12PipelineState> pipeline;
+    EventHandle fence_event;
+    UINT64 fence_value = 0;
+
+    bool create(void* d3d11_device);
+    bool submit_and_wait();
+    bool valid() const;
+};
 
 struct Params {
     float k[3];
@@ -175,22 +187,23 @@ D3D12_HEAP_PROPERTIES shared_output_heap_properties() {
     return properties;
 }
 
-bool create_cpu_to_gpu_buffer(UINT64 bytes, ComPtr<ID3D12Resource>& result) {
+bool create_cpu_to_gpu_buffer(D3D12Runtime& runtime,
+                              D3D12TransferPolicy& policy, UINT64 bytes,
+                              ComPtr<ID3D12Resource>& result) {
     const auto description = buffer_description(bytes);
-    auto heap = heap_properties(g_cpu_to_gpu_heap_type);
-    HRESULT create_result = g_dev->CreateCommittedResource(
+    auto heap = heap_properties(policy.input_heap);
+    HRESULT create_result = runtime.device->CreateCommittedResource(
         &heap, D3D12_HEAP_FLAG_NONE, &description,
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
         IID_PPV_ARGS(&result));
 #if defined(HAVE_D3D12_GPU_UPLOAD_HEAP)
     if (FAILED(create_result) &&
-        g_cpu_to_gpu_heap_type == D3D12_HEAP_TYPE_GPU_UPLOAD) {
+        policy.input_heap == D3D12_HEAP_TYPE_GPU_UPLOAD) {
         // Feature support can change after a driver reset, and an allocation
         // can still fail under memory pressure. Preserve the portable path.
-        g_gpu_upload_allocation_fallback.store(true,
-                                               std::memory_order_relaxed);
+        policy.gpu_upload_fallback = true;
         heap = heap_properties(D3D12_HEAP_TYPE_UPLOAD);
-        create_result = g_dev->CreateCommittedResource(
+        create_result = runtime.device->CreateCommittedResource(
             &heap, D3D12_HEAP_FLAG_NONE, &description,
             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
             IID_PPV_ARGS(&result));
@@ -200,26 +213,32 @@ bool create_cpu_to_gpu_buffer(UINT64 bytes, ComPtr<ID3D12Resource>& result) {
 }
 
 struct GPUInputBuffer {
+    D3D12Runtime* runtime = nullptr;
+    D3D12TransferPolicy* policy = nullptr;
     size_t bytes = 0;
     ComPtr<ID3D12Resource> buffer;
     ComPtr<ID3D12Resource> upload;
     void* mapped = nullptr;
 
-    explicit GPUInputBuffer(size_t buffer_bytes) : bytes(buffer_bytes) {
-        if (g_staged_input) {
-            if (!create_cpu_to_gpu_buffer(buffer_bytes, upload))
+    GPUInputBuffer(D3D12Runtime& runtime_value,
+                   D3D12TransferPolicy& policy_value, size_t buffer_bytes)
+        : runtime(&runtime_value), policy(&policy_value), bytes(buffer_bytes) {
+        if (policy->staged_input) {
+            if (!create_cpu_to_gpu_buffer(*runtime, *policy, buffer_bytes, upload))
                 return;
             const auto default_heap = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
             const auto description = buffer_description(buffer_bytes);
-            if (FAILED(g_dev->CreateCommittedResource(
+            if (FAILED(runtime->device->CreateCommittedResource(
                     &default_heap, D3D12_HEAP_FLAG_NONE, &description,
                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                     IID_PPV_ARGS(&buffer))))
                 return;
-        } else if (!create_cpu_to_gpu_buffer(buffer_bytes, buffer)) {
+        } else if (!create_cpu_to_gpu_buffer(*runtime, *policy, buffer_bytes,
+                                              buffer)) {
             return;
         }
-        ID3D12Resource* cpu_resource = g_staged_input ? upload.Get() : buffer.Get();
+        ID3D12Resource* cpu_resource =
+            policy->staged_input ? upload.Get() : buffer.Get();
         const D3D12_RANGE read_range{0, 0};
         if (FAILED(cpu_resource->Map(0, &read_range, &mapped)) || !mapped) {
             buffer.Reset();
@@ -228,7 +247,8 @@ struct GPUInputBuffer {
     }
 
     GPUInputBuffer(GPUInputBuffer&& other) noexcept
-        : bytes(other.bytes), buffer(std::move(other.buffer)),
+        : runtime(other.runtime), policy(other.policy), bytes(other.bytes),
+          buffer(std::move(other.buffer)),
           upload(std::move(other.upload)), mapped(other.mapped) {
         other.bytes = 0;
         other.mapped = nullptr;
@@ -239,6 +259,8 @@ struct GPUInputBuffer {
                 ID3D12Resource* resource = upload ? upload.Get() : buffer.Get();
                 if (resource) resource->Unmap(0, nullptr);
             }
+            runtime = other.runtime;
+            policy = other.policy;
             bytes = other.bytes;
             buffer = std::move(other.buffer);
             upload = std::move(other.upload);
@@ -272,32 +294,35 @@ struct GPUInputBuffer {
 };
 
 struct GPUOutputBuffer {
+    D3D12Runtime* runtime = nullptr;
+    D3D12TransferPolicy* policy = nullptr;
     size_t bytes = 0;
     ComPtr<ID3D12Resource> buffer;
     ComPtr<ID3D12Resource> readback;
     bool direct_mapped = false;
     void* mapped = nullptr;
 
-    explicit GPUOutputBuffer(size_t buffer_bytes) : bytes(buffer_bytes) {
+    GPUOutputBuffer(D3D12Runtime& runtime_value,
+                    D3D12TransferPolicy& policy_value, size_t buffer_bytes)
+        : runtime(&runtime_value), policy(&policy_value), bytes(buffer_bytes) {
         const auto output_description = buffer_description(
             buffer_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        if (g_direct_mapped_output) {
+        if (policy->direct_output) {
             const auto shared_heap = shared_output_heap_properties();
-            if (SUCCEEDED(g_dev->CreateCommittedResource(
+            if (SUCCEEDED(runtime->device->CreateCommittedResource(
                     &shared_heap, D3D12_HEAP_FLAG_NONE, &output_description,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                     IID_PPV_ARGS(&buffer)))) {
                 direct_mapped = true;
             } else {
-                g_direct_output_allocation_fallback.store(
-                    true, std::memory_order_relaxed);
+                policy->direct_output_fallback = true;
                 buffer.Reset();
             }
         }
 
         if (!direct_mapped) {
             const auto default_heap = heap_properties(D3D12_HEAP_TYPE_DEFAULT);
-            if (FAILED(g_dev->CreateCommittedResource(
+            if (FAILED(runtime->device->CreateCommittedResource(
                     &default_heap, D3D12_HEAP_FLAG_NONE, &output_description,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                     IID_PPV_ARGS(&buffer)))) {
@@ -306,7 +331,7 @@ struct GPUOutputBuffer {
 
             const auto readback_heap = heap_properties(D3D12_HEAP_TYPE_READBACK);
             const auto readback_description = buffer_description(buffer_bytes);
-            if (FAILED(g_dev->CreateCommittedResource(
+            if (FAILED(runtime->device->CreateCommittedResource(
                     &readback_heap, D3D12_HEAP_FLAG_NONE, &readback_description,
                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                     IID_PPV_ARGS(&readback)))) {
@@ -327,7 +352,8 @@ struct GPUOutputBuffer {
     }
 
     GPUOutputBuffer(GPUOutputBuffer&& other) noexcept
-        : bytes(other.bytes), buffer(std::move(other.buffer)),
+        : runtime(other.runtime), policy(other.policy), bytes(other.bytes),
+          buffer(std::move(other.buffer)),
           readback(std::move(other.readback)), direct_mapped(other.direct_mapped),
           mapped(other.mapped) {
         other.bytes = 0;
@@ -340,6 +366,8 @@ struct GPUOutputBuffer {
                 ID3D12Resource* resource = direct_mapped ? buffer.Get() : readback.Get();
                 if (resource) resource->Unmap(0, nullptr);
             }
+            runtime = other.runtime;
+            policy = other.policy;
             bytes = other.bytes;
             buffer = std::move(other.buffer);
             readback = std::move(other.readback);
@@ -373,7 +401,9 @@ struct GPUOutputBuffer {
 template<class T>
 class BufPool {
 public:
-    explicit BufPool(size_t threshold) : threshold_(threshold) {}
+    BufPool(D3D12Runtime& runtime, D3D12TransferPolicy& policy,
+            size_t threshold)
+        : runtime_(runtime), policy_(policy), threshold_(threshold) {}
 
     std::shared_ptr<T> Load(const void* data, UINT bytes) {
         auto result = Acquire(bytes);
@@ -394,6 +424,8 @@ public:
     }
 
 private:
+    D3D12Runtime& runtime_;
+    D3D12TransferPolicy& policy_;
     std::multimap<size_t, T> pool_;
     std::multimap<size_t, T> old_pool_;
     std::mutex mutex_;
@@ -414,7 +446,7 @@ private:
         }
 
         lock.unlock();
-        return T(bytes);
+        return T(runtime_, policy_, bytes);
     }
 
     void Release(T&& buffer) {
@@ -435,9 +467,6 @@ private:
         }
     }
 };
-
-BufPool<GPUInputBuffer> g_input_pool(16 * 1024 * 1024);
-BufPool<GPUOutputBuffer> g_output_pool(8 * 1024 * 1024);
 
 D3D12_RESOURCE_BARRIER transition(ID3D12Resource* resource,
                                   D3D12_RESOURCE_STATES before,
@@ -460,9 +489,18 @@ D3D12_RESOURCE_BARRIER uav_barrier(ID3D12Resource* resource) {
     return barrier;
 }
 
-bool execute(const GPUInputBuffer& y, const GPUInputBuffer& uv,
-             GPUOutputBuffer& output, const Params& params,
-             UINT work_width, UINT work_height) {
+struct D3D12Frame {
+    D3D12Runtime& runtime;
+    const D3D12TransferPolicy& policy;
+
+    bool execute(const GPUInputBuffer& y, const GPUInputBuffer& uv,
+                 GPUOutputBuffer& output, const Params& params,
+                 UINT work_width, UINT work_height);
+};
+
+bool D3D12Frame::execute(const GPUInputBuffer& y, const GPUInputBuffer& uv,
+                         GPUOutputBuffer& output, const Params& params,
+                         UINT work_width, UINT work_height) {
     if (!y.buffer || !uv.buffer || !output.valid())
         return false;
 
@@ -473,98 +511,70 @@ bool execute(const GPUInputBuffer& y, const GPUInputBuffer& uv,
         groups_y > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION)
         return false;
 
-    if (FAILED(g_allocator->Reset()) ||
-        FAILED(g_commands->Reset(g_allocator.Get(), g_nv12_to_bgra.Get()))) {
-        g_operational.store(false, std::memory_order_release);
+    if (FAILED(runtime.allocator->Reset()) ||
+        FAILED(runtime.commands->Reset(runtime.allocator.Get(),
+                                       runtime.pipeline.Get()))) {
         return false;
     }
 
-    g_commands->SetComputeRootSignature(g_root_signature.Get());
-    g_commands->SetComputeRoot32BitConstants(0, sizeof(params) / sizeof(UINT),
-                                             &params, 0);
-    g_commands->SetComputeRootShaderResourceView(
+    runtime.commands->SetComputeRootSignature(runtime.root_signature.Get());
+    runtime.commands->SetComputeRoot32BitConstants(
+        0, sizeof(params) / sizeof(UINT), &params, 0);
+    runtime.commands->SetComputeRootShaderResourceView(
         1, y.buffer->GetGPUVirtualAddress());
-    g_commands->SetComputeRootShaderResourceView(
+    runtime.commands->SetComputeRootShaderResourceView(
         2, uv.buffer->GetGPUVirtualAddress());
-    g_commands->SetComputeRootUnorderedAccessView(
+    runtime.commands->SetComputeRootUnorderedAccessView(
         3, output.buffer->GetGPUVirtualAddress());
 
-    if (g_staged_input) {
-        g_commands->CopyBufferRegion(y.buffer.Get(), 0, y.upload.Get(), 0, y.bytes);
-        g_commands->CopyBufferRegion(uv.buffer.Get(), 0, uv.upload.Get(), 0, uv.bytes);
+    if (policy.staged_input) {
+        runtime.commands->CopyBufferRegion(y.buffer.Get(), 0, y.upload.Get(), 0,
+                                           y.bytes);
+        runtime.commands->CopyBufferRegion(uv.buffer.Get(), 0, uv.upload.Get(),
+                                           0, uv.bytes);
         auto y_to_read = transition(y.buffer.Get(),
                                     D3D12_RESOURCE_STATE_COPY_DEST,
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         auto uv_to_read = transition(uv.buffer.Get(),
                                       D3D12_RESOURCE_STATE_COPY_DEST,
                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        g_commands->ResourceBarrier(1, &y_to_read);
-        g_commands->ResourceBarrier(1, &uv_to_read);
+        runtime.commands->ResourceBarrier(1, &y_to_read);
+        runtime.commands->ResourceBarrier(1, &uv_to_read);
     }
-    g_commands->Dispatch(groups_x, groups_y, 1);
+    runtime.commands->Dispatch(groups_x, groups_y, 1);
 
-    if (g_staged_input) {
+    if (policy.staged_input) {
         auto y_to_copy = transition(y.buffer.Get(),
                                     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                     D3D12_RESOURCE_STATE_COPY_DEST);
         auto uv_to_copy = transition(uv.buffer.Get(),
                                      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                      D3D12_RESOURCE_STATE_COPY_DEST);
-        g_commands->ResourceBarrier(1, &y_to_copy);
-        g_commands->ResourceBarrier(1, &uv_to_copy);
+        runtime.commands->ResourceBarrier(1, &y_to_copy);
+        runtime.commands->ResourceBarrier(1, &uv_to_copy);
     }
 
     if (output.direct_mapped) {
         auto output_complete = uav_barrier(output.buffer.Get());
-        g_commands->ResourceBarrier(1, &output_complete);
+        runtime.commands->ResourceBarrier(1, &output_complete);
     } else {
         auto to_copy = transition(output.buffer.Get(),
                                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
-        g_commands->ResourceBarrier(1, &to_copy);
-        g_commands->CopyBufferRegion(output.readback.Get(), 0,
-                                     output.buffer.Get(), 0, output.bytes);
+        runtime.commands->ResourceBarrier(1, &to_copy);
+        runtime.commands->CopyBufferRegion(output.readback.Get(), 0,
+                                           output.buffer.Get(), 0,
+                                           output.bytes);
         auto to_uav = transition(output.buffer.Get(),
                                  D3D12_RESOURCE_STATE_COPY_SOURCE,
                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        g_commands->ResourceBarrier(1, &to_uav);
+        runtime.commands->ResourceBarrier(1, &to_uav);
     }
 
-    if (FAILED(g_commands->Close())) {
-        g_operational.store(false, std::memory_order_release);
+    if (FAILED(runtime.commands->Close())) {
         return false;
     }
-    ID3D12CommandList* command_lists[] = {g_commands.Get()};
-    g_queue->ExecuteCommandLists(1, command_lists);
-
-    const UINT64 fence_value = ++g_fence_value;
-    if (FAILED(g_queue->Signal(g_fence.Get(), fence_value))) {
-        g_operational.store(false, std::memory_order_release);
-        return false;
-    }
-    const UINT64 completed_value = g_fence->GetCompletedValue();
-    if (completed_value == (std::numeric_limits<UINT64>::max)()) {
-        g_operational.store(false, std::memory_order_release);
-        return false;
-    }
-    if (completed_value < fence_value) {
-        if (FAILED(g_fence->SetEventOnCompletion(fence_value,
-                                                 g_fence_event.value))) {
-            g_operational.store(false, std::memory_order_release);
-            return false;
-        }
-        if (WaitForSingleObject(g_fence_event.value, INFINITE) != WAIT_OBJECT_0) {
-            g_operational.store(false, std::memory_order_release);
-            return false;
-        }
-    }
-    const UINT64 final_completed_value = g_fence->GetCompletedValue();
-    if (final_completed_value == (std::numeric_limits<UINT64>::max)() ||
-        final_completed_value < fence_value) {
-        g_operational.store(false, std::memory_order_release);
-        return false;
-    }
-    return true;
+    return runtime.submit_and_wait();
 }
 
 bool copyback_bgra(GPUOutputBuffer& output, void* destination,
@@ -594,37 +604,11 @@ bool copyback_bgra(GPUOutputBuffer& output, void* destination,
 void fill_params(const asco::ColorInfo& color_info, Params& params,
                  UINT width, UINT height) {
     params = {};
-    params.k[0] = color_info.trans_matrix == asco::ColorTransMatrix::BT601
-                      ? .299f : .2126f;
-    params.k[1] = color_info.trans_matrix == asco::ColorTransMatrix::BT601
-                      ? .587f : .7152f;
-    params.k[2] = color_info.trans_matrix == asco::ColorTransMatrix::BT601
-                      ? .114f : .0722f;
-    params.range[0] = color_info.nominal_range ==
-                              asco::ColorNominalRange::_0_255
-                          ? 0.0f : 16.0f / 255.0f;
-    params.range[1] = color_info.nominal_range ==
-                              asco::ColorNominalRange::_0_255
-                          ? 1.0f : 255.0f / 219.0f;
-    params.range[2] = params.range[0];
-    params.range[3] = color_info.nominal_range ==
-                              asco::ColorNominalRange::_0_255
-                          ? 1.0f : 255.0f / 224.0f;
+    const auto common = colorconv::make_color_params(color_info);
+    std::memcpy(params.k, common.k, sizeof(params.k));
+    std::memcpy(params.range, common.range, sizeof(params.range));
     params.w = width;
     params.h = height;
-}
-
-bool size_to_uint(size_t value, UINT& result) {
-    if (value > (std::numeric_limits<UINT>::max)())
-        return false;
-    result = static_cast<UINT>(value);
-    return true;
-}
-
-bool product_to_uint(size_t a, size_t b, UINT& result) {
-    if (a != 0 && b > (std::numeric_limits<UINT>::max)() / a)
-        return false;
-    return size_to_uint(a * b, result);
 }
 
 bool create_root_signature(ID3D12Device* device,
@@ -704,126 +688,34 @@ bool supports_direct_mapped_output(ID3D12Device* device) {
     return d3d12_common::supports_uma_write_back(device);
 }
 
-}  // namespace
-
-void init_d3d12_colorconv(void* d3d11_device) {
-    std::lock_guard<std::mutex> lock(g_run_mutex);
-    if (g_dev || !d3d11_device)
-        return;
-
-    auto* source_device = static_cast<ID3D11Device*>(d3d11_device);
-    ComPtr<IDXGIDevice> dxgi_device;
-    ComPtr<IDXGIAdapter> adapter;
-    if (FAILED(source_device->QueryInterface(IID_PPV_ARGS(&dxgi_device))) ||
-        FAILED(dxgi_device->GetAdapter(&adapter)))
-        return;
-
-    ComPtr<ID3D12Device> device;
-    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
-                                 IID_PPV_ARGS(&device))))
-        return;
-
-    const bool gpu_upload_heap_supported =
-        supports_gpu_upload_heap(device.Get());
-    const bool direct_mapped_output_supported =
-        supports_direct_mapped_output(device.Get());
+void D3D12TransferPolicy::detect(ID3D12Device* device) {
 #if defined(D3D12_FORCE_UPLOAD_COPY)
-    g_staged_input = true;
-#else
-    g_staged_input = false;
+    staged_input = true;
 #endif
-
-    D3D12_COMMAND_QUEUE_DESC queue_description{};
-    queue_description.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
-    queue_description.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-    queue_description.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
-    queue_description.NodeMask = 0;
-    ComPtr<ID3D12CommandQueue> queue;
-    if (FAILED(device->CreateCommandQueue(&queue_description,
-                                          IID_PPV_ARGS(&queue))))
-        return;
-
-    ComPtr<ID3D12CommandAllocator> allocator;
-    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
-                                              IID_PPV_ARGS(&allocator))))
-        return;
-
-    ComPtr<ID3D12RootSignature> root_signature;
-    if (!create_root_signature(device.Get(), root_signature))
-        return;
-
-    ComPtr<ID3D12PipelineState> pipeline;
-    if (!create_pipeline(device.Get(), root_signature.Get(), pipeline))
-        return;
-
-    ComPtr<ID3D12GraphicsCommandList> commands;
-    if (FAILED(device->CreateCommandList(
-            0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr,
-            IID_PPV_ARGS(&commands))) || FAILED(commands->Close()))
-        return;
-
-    ComPtr<ID3D12Fence> fence;
-    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-                                   IID_PPV_ARGS(&fence))))
-        return;
-
-    HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!event_handle)
-        return;
-
-    g_dev = std::move(device);
-    g_queue = std::move(queue);
-    g_allocator = std::move(allocator);
-    g_commands = std::move(commands);
-    g_fence = std::move(fence);
-    g_root_signature = std::move(root_signature);
-    g_nv12_to_bgra = std::move(pipeline);
-    g_fence_value = 0;
 #if defined(HAVE_D3D12_GPU_UPLOAD_HEAP)
-    g_cpu_to_gpu_heap_type = gpu_upload_heap_supported
-                                 ? D3D12_HEAP_TYPE_GPU_UPLOAD
-                                 : D3D12_HEAP_TYPE_UPLOAD;
+    input_heap = supports_gpu_upload_heap(device)
+                     ? D3D12_HEAP_TYPE_GPU_UPLOAD
+                     : D3D12_HEAP_TYPE_UPLOAD;
 #else
-    (void)gpu_upload_heap_supported;
-    g_cpu_to_gpu_heap_type = D3D12_HEAP_TYPE_UPLOAD;
+    (void)supports_gpu_upload_heap(device);
 #endif
-    if (g_staged_input)
-        g_cpu_to_gpu_heap_type = D3D12_HEAP_TYPE_UPLOAD;
-    g_direct_mapped_output = direct_mapped_output_supported;
-    g_gpu_upload_allocation_fallback.store(false, std::memory_order_relaxed);
-    g_direct_output_allocation_fallback.store(false,
-                                               std::memory_order_relaxed);
-    g_fence_event.reset(event_handle);
-    g_operational.store(true, std::memory_order_release);
+    if (staged_input)
+        input_heap = D3D12_HEAP_TYPE_UPLOAD;
+    direct_output = supports_direct_mapped_output(device);
 }
 
-bool is_d3d12_colorconv_avail() {
-    return g_enabled.load(std::memory_order_relaxed) &&
-           g_operational.load(std::memory_order_acquire) &&
-           g_dev && g_queue && g_allocator && g_commands &&
-           g_fence && g_root_signature && g_nv12_to_bgra && g_fence_event.value;
-}
-
-void d3d12_colorconv_set_enabled(bool enabled) {
-    g_enabled.store(enabled, std::memory_order_relaxed);
-}
-
-const char* d3d12_colorconv_transfer_mode() {
-    if (!g_operational.load(std::memory_order_acquire))
-        return "uninitialized";
+const char* D3D12TransferPolicy::description() const {
     const bool allocation_fallback =
-        g_gpu_upload_allocation_fallback.load(std::memory_order_relaxed) ||
-        g_direct_output_allocation_fallback.load(std::memory_order_relaxed);
+        gpu_upload_fallback || direct_output_fallback;
     bool gpu_upload_selected = false;
 #if defined(HAVE_D3D12_GPU_UPLOAD_HEAP)
-    gpu_upload_selected =
-        g_cpu_to_gpu_heap_type == D3D12_HEAP_TYPE_GPU_UPLOAD;
+    gpu_upload_selected = input_heap == D3D12_HEAP_TYPE_GPU_UPLOAD;
 #endif
-    if (g_staged_input && g_direct_mapped_output)
+    if (staged_input && direct_output)
         return "UPLOAD input -> DEFAULT; mapped shared-UAV output";
-    if (g_staged_input)
+    if (staged_input)
         return "UPLOAD input -> DEFAULT; DEFAULT-to-READBACK output";
-    if (gpu_upload_selected && g_direct_mapped_output) {
+    if (gpu_upload_selected && direct_output) {
         return allocation_fallback
                    ? "GPU_UPLOAD input; mapped shared-UAV output (allocation fallback used)"
                    : "GPU_UPLOAD input; mapped shared-UAV output";
@@ -833,7 +725,7 @@ const char* d3d12_colorconv_transfer_mode() {
                    ? "GPU_UPLOAD input; DEFAULT-to-READBACK output (allocation fallback used)"
                    : "GPU_UPLOAD input; DEFAULT-to-READBACK output";
     }
-    if (g_direct_mapped_output) {
+    if (direct_output) {
         return allocation_fallback
                    ? "mapped UPLOAD input; mapped shared-UAV output (allocation fallback used)"
                    : "mapped UPLOAD input; mapped shared-UAV output";
@@ -843,49 +735,180 @@ const char* d3d12_colorconv_transfer_mode() {
                : "mapped UPLOAD input; DEFAULT-to-READBACK output";
 }
 
-bool d3d12_nv12_to_bgra_frame(
-    const asco::ColorInfo& color_info, size_t width_value, size_t height_value,
-    void* destination, size_t destination_stride_value, const void* source_y,
-    size_t source_y_stride_value, const void* source_uv,
-    size_t source_uv_stride_value) {
-    std::lock_guard<std::mutex> lock(g_run_mutex);
-    if (!is_d3d12_colorconv_avail() || !destination || !source_y || !source_uv ||
-        width_value < 2 || height_value < 2 || (width_value & 1) ||
-        (height_value & 1))
+bool D3D12Runtime::create(void* d3d11_device) {
+    if (!d3d11_device)
+        return false;
+    auto* source_device = static_cast<ID3D11Device*>(d3d11_device);
+    ComPtr<IDXGIDevice> dxgi_device;
+    ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(source_device->QueryInterface(IID_PPV_ARGS(&dxgi_device))) ||
+        FAILED(dxgi_device->GetAdapter(&adapter)))
         return false;
 
-    UINT width, height, destination_stride, source_y_stride, source_uv_stride;
-    UINT y_bytes, uv_bytes, output_bytes;
-    if (!size_to_uint(width_value, width) ||
-        !size_to_uint(height_value, height) ||
-        !size_to_uint(destination_stride_value, destination_stride) ||
-        !size_to_uint(source_y_stride_value, source_y_stride) ||
-        !size_to_uint(source_uv_stride_value, source_uv_stride) ||
-        source_y_stride_value < width_value ||
-        source_uv_stride_value < width_value ||
-        width_value > (std::numeric_limits<UINT>::max)() / 4 ||
-        destination_stride_value < width_value * 4 ||
-        destination_stride_value >
-            (std::numeric_limits<size_t>::max)() / height_value ||
-        !product_to_uint(source_y_stride_value, height_value, y_bytes) ||
-        !product_to_uint(source_uv_stride_value, height_value / 2, uv_bytes) ||
-        !product_to_uint(width_value * 4, height_value, output_bytes))
+    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+                                 IID_PPV_ARGS(&device))))
         return false;
 
-    auto y_buffer = g_input_pool.Load(source_y, y_bytes);
-    auto uv_buffer = g_input_pool.Load(source_uv, uv_bytes);
-    auto output = g_output_pool.Acquire(output_bytes);
+    D3D12_COMMAND_QUEUE_DESC queue_description{};
+    queue_description.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+    queue_description.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queue_description.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    queue_description.NodeMask = 0;
+    if (FAILED(device->CreateCommandQueue(&queue_description,
+                                          IID_PPV_ARGS(&queue))))
+        return false;
+
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE,
+                                              IID_PPV_ARGS(&allocator))))
+        return false;
+
+    if (!create_root_signature(device.Get(), root_signature))
+        return false;
+
+    if (!create_pipeline(device.Get(), root_signature.Get(), pipeline))
+        return false;
+
+    if (FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_COMPUTE, allocator.Get(), nullptr,
+            IID_PPV_ARGS(&commands))) || FAILED(commands->Close()))
+        return false;
+
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                   IID_PPV_ARGS(&fence))))
+        return false;
+
+    HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event_handle)
+        return false;
+    fence_event.reset(event_handle);
+    fence_value = 0;
+    return true;
+}
+
+bool D3D12Runtime::submit_and_wait() {
+    ID3D12CommandList* command_lists[] = {commands.Get()};
+    queue->ExecuteCommandLists(1, command_lists);
+
+    const UINT64 submitted_value = ++fence_value;
+    if (FAILED(queue->Signal(fence.Get(), submitted_value)))
+        return false;
+    const UINT64 completed_value = fence->GetCompletedValue();
+    if (completed_value == (std::numeric_limits<UINT64>::max)())
+        return false;
+    if (completed_value < submitted_value) {
+        if (FAILED(fence->SetEventOnCompletion(submitted_value,
+                                               fence_event.value)) ||
+            WaitForSingleObject(fence_event.value, INFINITE) != WAIT_OBJECT_0)
+            return false;
+    }
+    const UINT64 final_value = fence->GetCompletedValue();
+    return final_value != (std::numeric_limits<UINT64>::max)() &&
+           final_value >= submitted_value;
+}
+
+bool D3D12Runtime::valid() const {
+    return device && queue && allocator && commands && fence &&
+           root_signature && pipeline && fence_event.value;
+}
+
+struct D3D12Converter {
+    D3D12Runtime runtime;
+    D3D12TransferPolicy policy;
+    BufPool<GPUInputBuffer> input_pool;
+    BufPool<GPUOutputBuffer> output_pool;
+    bool operational = false;
+
+    D3D12Converter()
+        : input_pool(runtime, policy, 16 * 1024 * 1024),
+          output_pool(runtime, policy, 8 * 1024 * 1024) {}
+
+    bool initialize(void* source_device) {
+        if (!runtime.create(source_device))
+            return false;
+        policy.detect(runtime.device.Get());
+        operational = true;
+        return true;
+    }
+
+    bool nv12_to_bgra(const asco::ColorInfo& color_info, size_t width,
+                      size_t height, void* destination,
+                      size_t destination_stride, const void* source_y,
+                      size_t source_y_stride, const void* source_uv,
+                      size_t source_uv_stride);
+};
+
+bool D3D12Converter::nv12_to_bgra(
+    const asco::ColorInfo& color_info, size_t width, size_t height,
+    void* destination, size_t destination_stride, const void* source_y,
+    size_t source_y_stride, const void* source_uv, size_t source_uv_stride) {
+    if (!operational || !destination || !source_y || !source_uv)
+        return false;
+
+    colorconv::Nv12Layout layout{};
+    if (!colorconv::validate_nv12(width, height, destination_stride,
+                                  source_y_stride, source_uv_stride, layout))
+        return false;
+
+    auto y_buffer = input_pool.Load(source_y, layout.y_bytes);
+    auto uv_buffer = input_pool.Load(source_uv, layout.uv_bytes);
+    auto output = output_pool.Acquire(layout.output_bytes);
     if (!y_buffer || !uv_buffer || !output || !y_buffer->buffer ||
         !uv_buffer->buffer || !output->valid())
         return false;
 
     Params params{};
-    fill_params(color_info, params, width, height);
-    params.ys = source_y_stride;
-    params.us = source_uv_stride;
-    params.os = width;
-    return execute(*y_buffer, *uv_buffer, *output, params,
-                   width / 2, height / 2) &&
-           copyback_bgra(*output, destination, destination_stride,
-                         width, height);
+    fill_params(color_info, params, layout.width, layout.height);
+    params.ys = layout.y_stride;
+    params.us = layout.uv_stride;
+    params.os = layout.width;
+    D3D12Frame frame{runtime, policy};
+    if (!frame.execute(*y_buffer, *uv_buffer, *output, params,
+                       layout.width / 2, layout.height / 2)) {
+        operational = false;
+        return false;
+    }
+    return copyback_bgra(*output, destination, layout.destination_stride,
+                         layout.width, layout.height);
+}
+
+std::unique_ptr<D3D12Converter> g_converter;
+
+}  // namespace
+
+void init_d3d12_colorconv(void* d3d11_device) {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    if (g_converter || !d3d11_device)
+        return;
+    auto converter = std::make_unique<D3D12Converter>();
+    if (converter->initialize(d3d11_device))
+        g_converter = std::move(converter);
+}
+
+bool is_d3d12_colorconv_avail() {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    return g_enabled.load(std::memory_order_relaxed) && g_converter &&
+           g_converter->operational && g_converter->runtime.valid();
+}
+
+void d3d12_colorconv_set_enabled(bool enabled) {
+    g_enabled.store(enabled, std::memory_order_relaxed);
+}
+
+const char* d3d12_colorconv_transfer_mode() {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    return g_converter && g_converter->operational
+               ? g_converter->policy.description()
+               : "uninitialized";
+}
+
+bool d3d12_nv12_to_bgra_frame(
+    const asco::ColorInfo& color_info, size_t width, size_t height,
+    void* destination, size_t destination_stride, const void* source_y,
+    size_t source_y_stride, const void* source_uv,
+    size_t source_uv_stride) {
+    std::lock_guard<std::mutex> lock(g_api_mutex);
+    return g_enabled.load(std::memory_order_relaxed) && g_converter &&
+           g_converter->nv12_to_bgra(
+               color_info, width, height, destination, destination_stride,
+               source_y, source_y_stride, source_uv, source_uv_stride);
 }
